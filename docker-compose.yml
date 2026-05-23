@@ -1,0 +1,44 @@
+version: "3.8"
+
+services:
+  freqtrade:
+    image: freqtradeorg/freqtrade:stable
+    container_name: kotipotibot_freqtrade
+    restart: unless-stopped
+    volumes:
+      - ./user_data:/freqtrade/user_data
+      - ./strategies:/freqtrade/user_data/strategies
+      - ./config.json:/freqtrade/user_data/config.json:ro
+    ports:
+      - "8090:8080"   # Web UI on host port 8090 → container 8080
+    command: >
+      trade
+      --logfile /freqtrade/user_data/logs/freqtrade.log
+      --config /freqtrade/user_data/config.json
+      --strategy ShortScalper
+    networks:
+      - kotipoti_net
+
+  hermes:
+    image: python:3.11-slim
+    container_name: kotipotibot_hermes
+    restart: unless-stopped
+    volumes:
+      - ./hermes:/app
+      - ./user_data/logs:/freqtrade/user_data/logs:ro
+      - ./user_data/data:/freqtrade/user_data/data:ro
+    working_dir: /app
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    command: >
+      sh -c "pip install requests schedule --quiet &&
+             python hermes_agent.py"
+    depends_on:
+      - freqtrade
+    networks:
+      - kotipoti_net
+
+networks:
+  kotipoti_net:
+    driver: bridge

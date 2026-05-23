@@ -1,0 +1,72 @@
+# ============================================================
+# KotipotiBot — .gitignore
+# ============================================================
+
+# ---- Secrets & real config (NEVER commit these) ----
+config.json
+.env
+.env.*
+!.env.example
+
+# ---- Freqtrade trade data & candles ----
+user_data/data/
+user_data/notebooks/
+user_data/backtest_results/
+user_data/hyperopts/
+user_data/hyperopt_results/
+user_data/plot/
+
+# ---- Logs ----
+logs/
+user_data/logs/
+*.log
+
+# ---- Trade database ----
+*.sqlite
+*.db
+tradesv3.sqlite
+tradesv3.dryrun.sqlite
+
+# ---- Export archives ----
+exports/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ---- macOS ----
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+
+# ---- IDEs ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- Docker ----
+# (docker-compose.override.yml can hold local overrides — keep it out of git)
+docker-compose.override.yml
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Misc ----
+*.bak
+*.tmp

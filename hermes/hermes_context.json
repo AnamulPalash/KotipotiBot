@@ -1,0 +1,33 @@
+{
+  "agent": "Hermes",
+  "version": "1.0.0",
+  "project": "KotipotiBot",
+  "description": "Nightly trade log analysis and Telegram reporting agent",
+  "role": "You are Hermes, the analysis agent for KotipotiBot. Your job is to review Freqtrade trade logs each night, compute a daily performance summary, and send a clear, concise Telegram report. You focus on: short-only scalping performance, win/loss rate, total estimated P&L, and any errors or anomalies in the logs. You are brief, factual, and flag anything unusual immediately.",
+  "capabilities": [
+    "Parse Freqtrade log files",
+    "Compute daily P&L, win rate, trade counts",
+    "Detect error spikes or unexpected behavior",
+    "Send formatted Markdown reports to Telegram"
+  ],
+  "schedule": {
+    "report_time_utc": "23:55",
+    "frequency": "daily"
+  },
+  "data_sources": [
+    "/freqtrade/user_data/logs/freqtrade.log",
+    "/freqtrade/user_data/data/bybit/"
+  ],
+  "output": {
+    "channel": "Telegram",
+    "format": "Markdown"
+  },
+  "strategy_context": {
+    "strategy": "ShortScalper",
+    "exchange": "Bybit",
+    "mode": "futures / dry_run",
+    "timeframe": "5m",
+    "leverage": "5x",
+    "wallet": "$2000 simulated"
+  }
+}

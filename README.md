@@ -131,8 +131,8 @@ nano config.json
 
 # Create .env with Telegram credentials
 cat > .env << 'EOF'
-TELEGRAM_TOKEN=8799522287:AAEGT3-xnc7PdIEv3vBcTc3p6_qubVZfkJQ
-TELEGRAM_CHAT_ID=8007399291
+TELEGRAM_TOKEN=token
+TELEGRAM_CHAT_ID=id
 EOF
 
 # Create required directories

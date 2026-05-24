@@ -65,18 +65,20 @@ SSH into the Pi and run these commands once:
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/palash2722/KotipotiBot.git
+git clone https://github.com/AnamulPalash/KotipotiBot.git
 cd KotipotiBot
 
 # 2. Create real config from example
 cp config.json.example config.json
 nano config.json
-# → Fill in: Bybit API key/secret, Telegram token/chat_id, UI password, JWT secret
+# → Fill in: Bybit API key/secret, UI password, JWT secret
+# → Telegram token and chat_id are already set via .env (see step 3)
 
-# 3. Create real .env from example
-cp .env.example .env
-nano .env
-# → Fill in: TELEGRAM_TOKEN and TELEGRAM_CHAT_ID
+# 3. Create .env with your Telegram credentials
+cat > .env << 'EOF'
+TELEGRAM_TOKEN=8799522287:AAEGT3-xnc7PdIEv3vBcTc3p6_qubVZfkJQ
+TELEGRAM_CHAT_ID=8007399291
+EOF
 
 # 4. Make export script executable
 chmod +x scripts/export_trades.sh

@@ -214,17 +214,24 @@ def admin_force_close(trade_id):
 def admin_commands():
     if not _check_auth():
         return jsonify({"ok": False, "error": "Unauthorised"}), 403
-    return jsonify(db.get_recent_commands(30))
+    try:
+        return jsonify(db.get_recent_commands(30))
+    except Exception as e:
+        return jsonify([])
 
 @app.route("/api/admin/bot_state")
 def admin_bot_state():
     if not _check_auth():
         return jsonify({"ok": False, "error": "Unauthorised"}), 403
-    return jsonify({
-        "status":         db.get_bot_state("status", "unknown"),
-        "last_heartbeat": db.get_bot_state("last_heartbeat", ""),
-        "active_pairs":   db.get_active_pairs(),
-    })
+    try:
+        return jsonify({
+            "status":         db.get_bot_state("status", "unknown"),
+            "last_heartbeat": db.get_bot_state("last_heartbeat", ""),
+            "active_pairs":   db.get_active_pairs(),
+        })
+    except Exception as e:
+        return jsonify({"status": "unknown", "last_heartbeat": "", "active_pairs": [],
+                        "_error": str(e)})
 
 # ── Health ─────────────────────────────────────────────────────────────────────
 
@@ -611,7 +618,7 @@ function barChart(data, {width=600,height=160,colorPos='#10B981',colorNeg='#EF44
     const v=d[valueKey], x=pad.l+gap+(barW+gap)*i;
     const bH=Math.abs(v)/maxAbs*(H/2-4);
     ctx.fillStyle=v>=0?colorPos:colorNeg;
-    ctx.beginPath(); ctx.roundRect(x,v>=0?midY-bH:midY,barW,bH,3); ctx.fill();
+    ctx.fillRect(x,v>=0?midY-bH:midY,barW,bH);
     ctx.fillStyle='#64748B'; ctx.font='10px sans-serif'; ctx.textAlign='center';
     ctx.fillText(d[labelKey],x+barW/2,height-8);
     ctx.fillStyle=v>=0?'#34D399':'#F87171'; ctx.font='bold 10px sans-serif';
@@ -1309,14 +1316,21 @@ def index():
 
 
 if __name__ == "__main__":
-    # Don't call init_db() here — the bot container owns schema creation.
-    # We just wait until the DB file exists before starting.
     import time
     db_path = os.environ.get("DB_PATH", "/data/kotipoti.db")
+    # Wait for DB file to appear (bot container creates it first)
     for _ in range(30):
         if os.path.exists(db_path):
             break
         log.info(f"Waiting for DB at {db_path}...")
         time.sleep(2)
+    # Run init_db() to ensure any new tables (commands, bot_state) exist
+    # even if the DB was originally created by an older bot version.
+    # init_db() uses CREATE TABLE IF NOT EXISTS — safe to call any time.
+    try:
+        db.init_db()
+        log.info("DB schema verified/upgraded OK")
+    except Exception as e:
+        log.warning(f"init_db warning (non-fatal): {e}")
     log.info(f"KotipotiBot Dashboard starting on port {PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)

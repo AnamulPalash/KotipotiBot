@@ -13,6 +13,8 @@ services:
       DRY_RUN: "true"          # Change to "false" for live trading
       DB_PATH: "/data/kotipoti.db"
       LOG_LEVEL: "INFO"
+      TELEGRAM_TOKEN:   "${TELEGRAM_TOKEN:-}"     # set in .env
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"   # set in .env
     command: python main.py
     networks:
       - kotipoti_net

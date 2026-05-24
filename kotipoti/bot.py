@@ -29,6 +29,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import db
+import telegram as tg
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -520,6 +521,7 @@ def record_exit_outcome(pair: str, profit_usdt: float, current_time: datetime):
             halt_until = current_time + timedelta(hours=cooldown_h)
             _consec_loss_halt_until = halt_until
             log.warning(f"[Safety] {max_consec} consecutive losses — halting entries for {cooldown_h}h")
+            tg.consecutive_loss_halt(max_consec, cooldown_h * 60)
     else:
         _consecutive_losses = 0
 
@@ -530,9 +532,10 @@ def check_daily_loss(wallet_start: float, wallet_now: float):
     limit_pct = float(p.get("daily_loss_limit", "10.0"))
     if wallet_start > 0:
         loss_pct = (wallet_start - wallet_now) / wallet_start * 100
-        if loss_pct >= limit_pct:
+        if loss_pct >= limit_pct and not _daily_loss_halted:
             _daily_loss_halted = True
             log.warning(f"[Safety] Daily loss {loss_pct:.1f}% >= {limit_pct}% — halting entries")
+            tg.daily_loss_halt(loss_pct, limit_pct)
 
 
 # ── Order placement ───────────────────────────────────────────────────────────
@@ -612,11 +615,13 @@ def _process_commands(exchange: ccxt.bybit):
                 _bot_paused = True
                 db.ack_command(cmd_id, "done", "Bot paused")
                 log.warning("[Admin] PAUSE command received — new entries halted")
+                tg.bot_status("paused", "New entries halted via admin panel.")
 
             elif command == "resume":
                 _bot_paused = False
                 db.ack_command(cmd_id, "done", "Bot resumed")
                 log.info("[Admin] RESUME command received")
+                tg.bot_status("resumed", "Signal evaluation active again.")
 
             elif command == "force_close":
                 trade_id = payload.get("trade_id")
@@ -641,6 +646,8 @@ def _process_commands(exchange: ccxt.bybit):
                 db.ack_command(cmd_id, "done",
                                f"Force closed trade {trade_id} @ {price:.4f}")
                 log.warning(f"[Admin] Force closed trade #{trade_id} {trade['pair']} @ {price}")
+                tg.trade_closed(trade["pair"], trade["side"], trade["entry_price"],
+                                price, 0, 0, "force_close", DRY_RUN)
 
             elif command == "update_pairs":
                 pairs = payload.get("pairs", [])
@@ -668,6 +675,7 @@ def run():
 
     db.init_db()
     exchange = make_exchange()
+    tg.bot_status("started", f"DRY_RUN={DRY_RUN} | Pairs: {', '.join(PAIRS)}")
 
     wallet_start = float(db.get_param("wallet_start", "0") or "0")
     if wallet_start == 0:
@@ -688,6 +696,7 @@ def run():
         _process_commands(exchange)
         if _bot_stopped:
             log.info("[Bot] Stop command received — exiting loop.")
+            tg.bot_status("stopped", "Stop command received via admin panel.")
             break
 
         # Update bot state heartbeat for dashboard
@@ -745,13 +754,22 @@ def run():
                 entry_p    = trade["entry_price"]
                 if trade_side == "long":
                     profit_usdt = (exit_price - entry_p) / entry_p * stake * lev
+                    profit_pct  = (exit_price - entry_p) / entry_p * 100 * lev
                 else:
                     profit_usdt = (entry_p - exit_price) / entry_p * stake * lev
+                    profit_pct  = (entry_p - exit_price) / entry_p * 100 * lev
                 record_exit_outcome(trade["pair"], profit_usdt, now)
                 emoji = "✅" if profit_usdt >= 0 else "❌"
                 log.info(f"{emoji} CLOSED {trade_side.upper()} {trade['pair']} "
                          f"@ {exit_price:.4f} | reason={reason} "
                          f"| P&L={profit_usdt:+.2f} USDT")
+                if reason == "stoploss":
+                    tg.stoploss_hit(trade["pair"], trade_side, entry_p,
+                                    exit_price, profit_usdt, DRY_RUN)
+                else:
+                    tg.trade_closed(trade["pair"], trade_side, entry_p,
+                                    exit_price, profit_usdt, profit_pct,
+                                    reason, DRY_RUN)
 
             # Reload open trades after exits
             open_trades = db.get_open_trades()
@@ -820,6 +838,8 @@ def run():
                                 atr_at_entry=sig["atr_pct"],
                                 dry_run=DRY_RUN,
                             )
+                            tg.trade_opened(pair, direction, price, stake,
+                                            leverage, entry_tag, DRY_RUN)
                             db.log_signal(
                                 pair=pair, direction=direction, fired=True,
                                 price=price, rsi=sig["rsi"],

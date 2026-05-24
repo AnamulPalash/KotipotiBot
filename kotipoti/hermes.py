@@ -32,6 +32,7 @@ from typing import Dict, List, Optional
 from collections import defaultdict
 
 import db
+import telegram as tg
 
 log = logging.getLogger("kotipoti.hermes")
 
@@ -332,6 +333,7 @@ def run_once():
         if suggestions:
             log.info(f"[Hermes] Applying {len(suggestions)} parameter update(s)...")
             apply_suggestions(suggestions)
+            tg.hermes_tuned(suggestions)
         else:
             log.info("[Hermes] No parameter changes needed.")
 

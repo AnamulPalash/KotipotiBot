@@ -16,7 +16,7 @@ app = Flask(__name__)
 CORS(app)
 
 # ── Admin auth ────────────────────────────────────────────────────────────────
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "kotipoti")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "CHANGE_ME")
 # Simple in-memory token store: token → True (single-user, resets on restart)
 _valid_tokens: set = set()
 
@@ -185,11 +185,13 @@ def admin_pairs():
         return jsonify({"ok": False, "error": "Unauthorised"}), 403
     data  = request.get_json(silent=True) or {}
     pairs = data.get("pairs")  # full replacement list
-    if not isinstance(pairs, list) or not pairs:
-        return jsonify({"ok": False, "error": "Provide non-empty pairs list"}), 400
-    db.set_active_pairs(pairs)
-    db.send_command("update_pairs", {"pairs": pairs})
-    return jsonify({"ok": True, "pairs": pairs})
+    try:
+        clean_pairs = db.validate_pairs(pairs)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    db.set_active_pairs(clean_pairs)
+    db.send_command("update_pairs", {"pairs": clean_pairs})
+    return jsonify({"ok": True, "pairs": clean_pairs})
 
 @app.route("/api/admin/params", methods=["POST"])
 def admin_params():
@@ -199,9 +201,15 @@ def admin_params():
     updates = data.get("updates", {})
     if not updates:
         return jsonify({"ok": False, "error": "No updates provided"}), 400
-    for k, v in updates.items():
+    cleaned = {}
+    try:
+        for k, v in updates.items():
+            cleaned[k] = db.validate_param_update(k, v)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    for k, v in cleaned.items():
         db.set_param(k, v, updated_by="admin")
-    return jsonify({"ok": True, "updated": list(updates.keys())})
+    return jsonify({"ok": True, "updated": list(cleaned.keys())})
 
 @app.route("/api/admin/force_close/<int:trade_id>", methods=["POST"])
 def admin_force_close(trade_id):
@@ -1314,14 +1322,14 @@ function buildAdmin() {
   const paramCard = el('div',{class:'card'});
   paramCard.appendChild(el('div',{class:'card-title'},'⚙️ Strategy Parameters'));
   paramCard.appendChild(el('p',{style:'font-size:12px;color:#64748B;margin-bottom:12px'},
-    'Edit values below then click Save. Hermes may override these automatically.'));
+    'Edit values below then click Save. Hermes records suggestions; auto-apply is disabled unless explicitly enabled.'));
 
   const paramGroups = {
     'Signal Thresholds': ['rsi_short_entry','rsi_long_entry','rsi_exit_short','rsi_exit_long','volume_multiplier','vwap_dev_min'],
     'Bollinger / EMA':   ['bb_period','bb_std','ema_fast','ema_slow'],
     'ATR Filter':        ['atr_period','atr_min_pct','atr_max_pct'],
     'Risk / Position':   ['stoploss_pct','trailing_pct','trailing_offset','leverage','max_open_trades','stake_usdt'],
-    'Circuit Breakers':  ['daily_loss_limit','max_consec_losses','pair_cooldown_min','blocked_sessions'],
+    'Circuit Breakers':  ['daily_loss_limit','max_consec_losses','pair_cooldown_min','blocked_sessions','hermes_auto_apply'],
   };
 
   for (const [groupName, keys] of Object.entries(paramGroups)) {

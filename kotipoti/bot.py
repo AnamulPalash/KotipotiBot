@@ -26,6 +26,7 @@ import os
 import json
 import sys
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_DOWN
 from typing import Dict, List, Optional, Tuple
 
 import db
@@ -33,13 +34,18 @@ import telegram as tg
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_PATH = os.environ.get("BOT_LOG_PATH", "/data/bot.log")
+try:
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+except OSError:
+    LOG_PATH = "/tmp/kotipoti_bot.log"
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/data/bot.log", mode="a"),
+        logging.FileHandler(LOG_PATH, mode="a"),
     ]
 )
 log = logging.getLogger("kotipoti")
@@ -49,17 +55,15 @@ DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() != "false"
 API_KEY   = os.environ.get("BYBIT_API_KEY", "")
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 
-PAIRS = [
-    "BTC/USDT:USDT",
-    "ETH/USDT:USDT",
-    "SOL/USDT:USDT",
-    "DOGE/USDT:USDT",
-    "XRP/USDT:USDT",
-]
+PAIRS = db.DEFAULT_PAIRS
 ALT_PAIRS = {"ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"}
 BTC_PAIR  = "BTC/USDT:USDT"
 TIMEFRAME = "5m"
-CANDLES_NEEDED = 100  # enough for EMA21, BB20, ATR14, VWAP
+CANDLES_NEEDED = int(os.environ.get("CANDLES_NEEDED", "200"))
+CANDLES_15M = int(os.environ.get("CANDLES_15M", "150"))
+CANDLES_1H = int(os.environ.get("CANDLES_1H", "150"))
+CANDLES_4H = int(os.environ.get("CANDLES_4H", "120"))
+MAX_API_ERRORS_PER_HOUR = int(os.environ.get("MAX_API_ERRORS_PER_HOUR", "5"))
 
 # ── Runtime state (in-memory) ─────────────────────────────────────────────────
 _consecutive_losses: int = 0
@@ -70,6 +74,55 @@ _pair_last_loss: Dict[str, datetime] = {}   # pair -> time of last losing exit
 _api_error_times: List[datetime] = []
 _bot_paused: bool = False
 _bot_stopped: bool = False
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _load_safety_state():
+    global _consecutive_losses, _consec_loss_halt_until
+    global _daily_loss_halted, _daily_loss_reset_day, _pair_last_loss
+    try:
+        raw = db.get_bot_state("safety_state", "{}")
+        state = json.loads(raw) if raw else {}
+        _consecutive_losses = int(state.get("consecutive_losses", 0))
+        halt = state.get("consec_loss_halt_until")
+        _consec_loss_halt_until = datetime.fromisoformat(halt) if halt else None
+        _daily_loss_halted = bool(state.get("daily_loss_halted", False))
+        _daily_loss_reset_day = state.get("daily_loss_reset_day")
+        if _daily_loss_reset_day is not None:
+            _daily_loss_reset_day = int(_daily_loss_reset_day)
+        _pair_last_loss = {
+            pair: datetime.fromisoformat(ts)
+            for pair, ts in state.get("pair_last_loss", {}).items()
+        }
+    except Exception as e:
+        log.warning(f"[Safety] Could not load persisted state: {e}")
+
+
+def _save_safety_state():
+    state = {
+        "consecutive_losses": _consecutive_losses,
+        "consec_loss_halt_until": _consec_loss_halt_until.isoformat()
+        if _consec_loss_halt_until else None,
+        "daily_loss_halted": _daily_loss_halted,
+        "daily_loss_reset_day": _daily_loss_reset_day,
+        "pair_last_loss": {
+            pair: ts.isoformat() for pair, ts in _pair_last_loss.items()
+        },
+    }
+    db.set_bot_state("safety_state", json.dumps(state))
+
+
+def _prune_api_errors(now: datetime):
+    global _api_error_times
+    cutoff = now - timedelta(hours=1)
+    _api_error_times = [t for t in _api_error_times if t > cutoff]
+
+
+def _record_api_error():
+    _api_error_times.append(_utc_now())
 
 
 # ── Exchange setup ────────────────────────────────────────────────────────────
@@ -101,14 +154,15 @@ def fetch_ohlcv(exchange: ccxt.bybit, pair: str, timeframe: str,
         return df
     except Exception as e:
         log.warning(f"fetch_ohlcv {pair} {timeframe}: {e}")
+        _record_api_error()
         return None
 
 
 # ── Indicator computation ─────────────────────────────────────────────────────
 
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def compute_indicators(df: pd.DataFrame, p: Optional[Dict[str, str]] = None) -> pd.DataFrame:
     """Add all technical indicators to a 5m OHLCV dataframe."""
-    p = db.get_all_params()
+    p = p or db.get_all_params()
 
     bb_period = int(p.get("bb_period", "20"))
     bb_std    = float(p.get("bb_std", "2.0"))
@@ -221,17 +275,65 @@ def session_label() -> str:
         return "US"
 
 
+def _decision_snapshot(df: pd.DataFrame) -> Dict:
+    row = df.iloc[-1]
+    close = float(row["close"])
+    upper = float(row.get("bb_upper", 0) or 0)
+    lower = float(row.get("bb_lower", 0) or 0)
+    return {
+        "candle_ts": str(row.get("date", "")),
+        "price": close,
+        "rsi": float(row.get("rsi", 0) or 0),
+        "atr_pct": float(row.get("atr_pct", 0) or 0),
+        "vwap_dev": float(row.get("vwap_dev", 0) or 0),
+        "volume_ratio": float(row.get("volume_ratio", 0) or 0),
+        "bb_position": "above" if upper and close > upper else "below" if lower and close < lower else "inside",
+        "ema_trend": "bear" if float(row.get("ema_fast", 0) or 0) < float(row.get("ema_slow", 0) or 0) else "bull",
+    }
+
+
+def log_decision_snapshot(pair: str, df: pd.DataFrame, p: Dict[str, str],
+                          btc_regime_label: str, pair_15m_regime_label: str,
+                          pair_1h_regime_label: str, pair_4h_regime_label: str,
+                          signal_type: str, fired: bool = False,
+                          skip_reason: str = None, context: dict = None):
+    snap = _decision_snapshot(df)
+    db.log_decision(
+        pair=pair,
+        candle_ts=snap["candle_ts"],
+        price=snap["price"],
+        rsi=snap["rsi"],
+        atr_pct=snap["atr_pct"],
+        vwap_dev=snap["vwap_dev"],
+        volume_ratio=snap["volume_ratio"],
+        bb_position=snap["bb_position"],
+        ema_trend=snap["ema_trend"],
+        btc_1h_regime=btc_regime_label,
+        pair_15m_regime=pair_15m_regime_label,
+        pair_1h_regime=pair_1h_regime_label,
+        pair_4h_regime=pair_4h_regime_label,
+        signal_type=signal_type,
+        fired=fired,
+        skip_reason=skip_reason,
+        params_snapshot=p,
+        context=context,
+    )
+
+
 # ── Signal evaluation ─────────────────────────────────────────────────────────
 
 def evaluate_signals(pair: str, df5m: pd.DataFrame,
                      btc_regime_label: str,
-                     pair_regime_label: str) -> List[Dict]:
+                     pair_regime_label: str,
+                     pair_15m_regime_label: str = "unknown",
+                     pair_4h_regime_label: str = "unknown",
+                     p: Optional[Dict[str, str]] = None) -> List[Dict]:
     """
     Returns list of signal dicts with keys:
       direction, entry_tag, price, confidence (0-1)
     Empty list if no signal.
     """
-    p      = db.get_all_params()
+    p      = p or db.get_all_params()
     row    = df5m.iloc[-1]
     signals = []
     session = session_label()
@@ -287,11 +389,15 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     if bb_short_ok and rsi_short_ok and vol_ok:
         overextended = rsi > 80
         trend_ok = not (pair_regime_label == "bull" and not overextended)
+        confirm_ok = not (
+            pair_15m_regime_label == "bull" and pair_4h_regime_label == "bull"
+            and not overextended
+        )
         btc_ok = True
         if pair in ALT_PAIRS:
             btc_ok = not (btc_regime_label == "bull" and not overextended)
 
-        if trend_ok and btc_ok:
+        if trend_ok and confirm_ok and btc_ok:
             bb_pct = (close - bb_upper) / bb_upper * 100
             ema_gap = (ema_f - ema_s) / close * 100
             log.info(f"[Signal] ✅ bb_short {pair} rsi={rsi:.1f} bb_pct={bb_pct:.2f}% vol={vol_ratio:.2f}x")
@@ -303,7 +409,7 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
                 "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
             })
         else:
-            reason = "trend_filter" if not trend_ok else "btc_filter"
+            reason = "trend_filter" if not trend_ok else "confirmation_filter" if not confirm_ok else "btc_filter"
             log.info(f"[Signal] ⛔ bb_short {pair} blocked: {reason}")
             db.log_signal(pair, "short", fired=False, skip_reason=reason,
                           price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
@@ -320,11 +426,15 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     if bb_long_ok and rsi_long_ok and vol_ok:
         overextended = rsi < 20
         trend_ok = not (pair_regime_label == "bear" and not overextended)
+        confirm_ok = not (
+            pair_15m_regime_label == "bear" and pair_4h_regime_label == "bear"
+            and not overextended
+        )
         btc_ok = True
         if pair in ALT_PAIRS:
             btc_ok = not (btc_regime_label == "bear" and not overextended)
 
-        if trend_ok and btc_ok:
+        if trend_ok and confirm_ok and btc_ok:
             bb_pct = (bb_lower - close) / bb_lower * 100
             ema_gap = (ema_f - ema_s) / close * 100
             log.info(f"[Signal] ✅ bb_long {pair} rsi={rsi:.1f} bb_pct={bb_pct:.2f}% vol={vol_ratio:.2f}x")
@@ -336,7 +446,7 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
                 "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
             })
         else:
-            reason = "trend_filter" if not trend_ok else "btc_filter"
+            reason = "trend_filter" if not trend_ok else "confirmation_filter" if not confirm_ok else "btc_filter"
             log.info(f"[Signal] ⛔ bb_long {pair} blocked: {reason}")
             db.log_signal(pair, "long", fired=False, skip_reason=reason,
                           price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
@@ -349,7 +459,7 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     # ── VWAP reversion SHORT ──────────────────────────────────────────────────
     # vol_mult (not 1.3x) — VWAP signal doesn't need as extreme a volume spike
     if vwap_dev > vwap_min and vol_ratio >= vol_mult and rsi > 60:
-        trend_ok = pair_regime_label != "bull"
+        trend_ok = pair_regime_label != "bull" and pair_15m_regime_label != "bull"
         btc_ok   = btc_regime_label != "bull" if pair in ALT_PAIRS else True
         if trend_ok and btc_ok:
             log.info(f"[Signal] ✅ vwap_short {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}")
@@ -364,7 +474,7 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
 
     # ── VWAP reversion LONG ───────────────────────────────────────────────────
     if vwap_dev < -vwap_min and vol_ratio >= vol_mult and rsi < 40:
-        trend_ok = pair_regime_label != "bear"
+        trend_ok = pair_regime_label != "bear" and pair_15m_regime_label != "bear"
         btc_ok   = btc_regime_label != "bear" if pair in ALT_PAIRS else True
         if trend_ok and btc_ok:
             log.info(f"[Signal] ✅ vwap_long {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}")
@@ -410,15 +520,27 @@ def check_exits(open_trades: List[Dict], df5m: Dict[str, pd.DataFrame],
         else:
             profit_pct = (entry_price - current) / entry_price
 
+        peak = max(float(trade.get("peak_price") or entry_price), current)
+        trough = min(float(trade.get("trough_price") or entry_price), current)
+        if peak != trade.get("peak_price") or trough != trade.get("trough_price"):
+            db.update_trade_extremes(trade_id, peak, trough)
+
         # Hard stoploss
         if profit_pct <= -sl_pct:
             exits.append((trade_id, current, "stoploss"))
             continue
 
-        # Trailing stop: only kicks in once offset is reached
-        if profit_pct >= trail_offset:
-            trail_stop = profit_pct - trail_pct
-            if trail_stop <= 0:
+        # Trailing stop: track max favorable excursion since entry.
+        if side == "long":
+            best_profit_pct = (peak - entry_price) / entry_price
+            trail_price = peak * (1 - trail_pct)
+            if best_profit_pct >= trail_offset and current <= trail_price:
+                exits.append((trade_id, current, "trailing_stop"))
+                continue
+        else:
+            best_profit_pct = (entry_price - trough) / entry_price
+            trail_price = trough * (1 + trail_pct)
+            if best_profit_pct >= trail_offset and current >= trail_price:
                 exits.append((trade_id, current, "trailing_stop"))
                 continue
 
@@ -468,6 +590,7 @@ def safety_ok(pair: str, current_time: datetime) -> Tuple[bool, str]:
     p = db.get_all_params()
     max_consec   = int(p.get("max_consec_losses", "4"))
     cooldown_min = int(p.get("pair_cooldown_min", "15"))
+    _prune_api_errors(current_time.astimezone(timezone.utc) if current_time.tzinfo else current_time.replace(tzinfo=timezone.utc))
 
     utc = current_time.replace(tzinfo=timezone.utc) if current_time.tzinfo is None \
           else current_time.astimezone(timezone.utc)
@@ -477,9 +600,13 @@ def safety_ok(pair: str, current_time: datetime) -> Tuple[bool, str]:
     if _daily_loss_reset_day != today:
         _daily_loss_reset_day = today
         _daily_loss_halted = False
+        _save_safety_state()
 
     if _daily_loss_halted:
         return False, "daily_loss_halt"
+
+    if len(_api_error_times) >= MAX_API_ERRORS_PER_HOUR:
+        return False, f"api_error_limit_{MAX_API_ERRORS_PER_HOUR}_per_hour"
 
     # Consecutive loss halt
     if _consec_loss_halt_until is not None:
@@ -492,6 +619,7 @@ def safety_ok(pair: str, current_time: datetime) -> Tuple[bool, str]:
         else:
             _consec_loss_halt_until = None
             _consecutive_losses = 0
+            _save_safety_state()
 
     # Per-pair cooldown after a loss
     last_loss = _pair_last_loss.get(pair)
@@ -521,8 +649,10 @@ def record_exit_outcome(pair: str, profit_usdt: float, current_time: datetime):
             _consec_loss_halt_until = halt_until
             log.warning(f"[Safety] {max_consec} consecutive losses — halting entries for {cooldown_h}h")
             tg.consecutive_loss_halt(max_consec, cooldown_h * 60)
+        _save_safety_state()
     else:
         _consecutive_losses = 0
+        _save_safety_state()
 
 
 def check_daily_loss(wallet_start: float, wallet_now: float):
@@ -535,16 +665,87 @@ def check_daily_loss(wallet_start: float, wallet_now: float):
             _daily_loss_halted = True
             log.warning(f"[Safety] Daily loss {loss_pct:.1f}% >= {limit_pct}% — halting entries")
             tg.daily_loss_halt(loss_pct, limit_pct)
+            _save_safety_state()
 
 
 # ── Order placement ───────────────────────────────────────────────────────────
+
+def _position_amount(exchange: ccxt.bybit, pair: str, stake_usdt: float,
+                     leverage: int, current_price: float) -> float:
+    raw_amount = stake_usdt * leverage / current_price
+    if DRY_RUN:
+        return round(raw_amount, 6)
+    try:
+        exchange.load_markets()
+        market = exchange.market(pair)
+        min_amount = (market.get("limits", {}).get("amount", {}) or {}).get("min")
+        min_cost = (market.get("limits", {}).get("cost", {}) or {}).get("min")
+        amount = float(exchange.amount_to_precision(pair, raw_amount))
+    except Exception:
+        # Fall back to a conservative decimal trim if ccxt metadata is unavailable.
+        amount = float(Decimal(str(raw_amount)).quantize(Decimal("0.000001"), rounding=ROUND_DOWN))
+        min_amount = None
+        min_cost = None
+    if min_amount and amount < float(min_amount):
+        raise ValueError(f"amount {amount} below exchange minimum {min_amount}")
+    if min_cost and amount * current_price < float(min_cost):
+        raise ValueError(f"notional {amount * current_price:.4f} below exchange minimum {min_cost}")
+    return amount
+
+
+def _stop_price(side: str, entry_price: float, stoploss_pct: float) -> float:
+    if side == "long":
+        return entry_price * (1 - stoploss_pct / 100)
+    return entry_price * (1 + stoploss_pct / 100)
+
+
+def place_exchange_stop(exchange: ccxt.bybit, pair: str, side: str,
+                        amount: float, entry_price: float) -> Optional[str]:
+    """Place a reduce-only conditional stop order in live mode."""
+    if DRY_RUN:
+        return f"dry_stop_{int(time.time())}"
+    p = db.get_all_params()
+    stoploss_pct = float(p.get("stoploss_pct", "2.5"))
+    stop_price = _stop_price(side, entry_price, stoploss_pct)
+    try:
+        stop_price = float(exchange.price_to_precision(pair, stop_price))
+    except Exception:
+        stop_price = round(stop_price, 4)
+
+    close_side = "sell" if side == "long" else "buy"
+    try:
+        order = exchange.create_order(
+            symbol=pair,
+            type="market",
+            side=close_side,
+            amount=amount,
+            price=None,
+            params={
+                "triggerPrice": stop_price,
+                "reduceOnly": True,
+                "positionIdx": 1 if side == "long" else 2,
+                "triggerDirection": 2 if side == "long" else 1,
+            },
+        )
+        stop_id = order.get("id")
+        log.info(f"[Order] STOP {side.upper()} {pair} trigger={stop_price:.4f} | id={stop_id}")
+        return stop_id
+    except Exception as e:
+        log.error(f"[Order] Failed to place protective stop for {side} {pair}: {e}")
+        _record_api_error()
+        return None
+
 
 def place_order(exchange: ccxt.bybit, pair: str, side: str,
                 stake_usdt: float, leverage: int,
                 current_price: float) -> Optional[Dict]:
     """Place a market order. Returns order dict or None on failure."""
+    try:
+        amount = _position_amount(exchange, pair, stake_usdt, leverage, current_price)
+    except Exception as e:
+        log.error(f"[Order] Invalid order size for {side} {pair}: {e}")
+        return None
     if DRY_RUN:
-        amount = round(stake_usdt * leverage / current_price, 6)
         log.info(f"[DryRun] {side.upper()} {pair} @ {current_price:.4f} "
                  f"| stake={stake_usdt} USDT | amount={amount} | lev={leverage}x")
         return {
@@ -555,7 +756,6 @@ def place_order(exchange: ccxt.bybit, pair: str, side: str,
         }
     try:
         exchange.set_leverage(leverage, pair)
-        amount = round(stake_usdt * leverage / current_price, 6)
         order = exchange.create_market_order(
             symbol=pair,
             side="buy" if side == "long" else "sell",
@@ -567,17 +767,23 @@ def place_order(exchange: ccxt.bybit, pair: str, side: str,
         return order
     except Exception as e:
         log.error(f"[Order] Failed to place {side} on {pair}: {e}")
-        _api_error_times.append(datetime.now(timezone.utc))
+        _record_api_error()
         return None
 
 
 def close_order(exchange: ccxt.bybit, pair: str, side: str, amount: float,
-                current_price: float, reason: str):
+                current_price: float, reason: str, stop_order_id: str = "") -> bool:
     """Close an open position with a market order."""
     if DRY_RUN:
         log.info(f"[DryRun] CLOSE {side.upper()} {pair} @ {current_price:.4f} ({reason})")
-        return
+        return True
     try:
+        if stop_order_id:
+            try:
+                exchange.cancel_order(stop_order_id, pair)
+                log.info(f"[Order] Cancelled protective stop {stop_order_id} for {pair}")
+            except Exception as e:
+                log.warning(f"[Order] Could not cancel protective stop {stop_order_id}: {e}")
         close_side = "sell" if side == "long" else "buy"
         exchange.create_market_order(
             symbol=pair,
@@ -589,8 +795,11 @@ def close_order(exchange: ccxt.bybit, pair: str, side: str, amount: float,
             }
         )
         log.info(f"[Order] CLOSE {side.upper()} {pair} @ {current_price:.4f} ({reason})")
+        return True
     except Exception as e:
         log.error(f"[Order] Failed to close {side} on {pair}: {e}")
+        _record_api_error()
+        return False
 
 
 # ── Admin command processor ───────────────────────────────────────────────────
@@ -639,8 +848,13 @@ def _process_commands(exchange: ccxt.bybit):
                 except Exception as e:
                     price = trade["entry_price"]
                     log.warning(f"[Admin] Could not fetch price for force close: {e}")
-                close_order(exchange, trade["pair"], trade["side"],
-                            trade["amount"], price, "admin_force_close")
+                close_ok = close_order(exchange, trade["pair"], trade["side"],
+                                       trade["amount"], price, "admin_force_close",
+                                       trade.get("stop_order_id") or "")
+                if not close_ok:
+                    db.ack_command(cmd_id, "error",
+                                   f"Exchange close failed for trade {trade_id}; DB left open")
+                    continue
                 db.close_trade(trade_id, price, "force_close", "admin")
                 db.ack_command(cmd_id, "done",
                                f"Force closed trade {trade_id} @ {price:.4f}")
@@ -673,8 +887,10 @@ def run():
     log.info("=" * 60)
 
     db.init_db()
+    _load_safety_state()
     exchange = make_exchange()
-    tg.bot_status("started", f"DRY_RUN={DRY_RUN} | Pairs: {', '.join(PAIRS)}")
+    active_pairs = db.get_active_pairs()
+    tg.bot_status("started", f"DRY_RUN={DRY_RUN} | Pairs: {', '.join(active_pairs)}")
 
     wallet_start = float(db.get_param("wallet_start", "0") or "0")
     if wallet_start == 0:
@@ -683,7 +899,7 @@ def run():
 
     last_candle_time: Dict[str, str] = {}  # pair -> last processed candle timestamp
 
-    log.info(f"Pairs: {PAIRS}")
+    log.info(f"Pairs: {active_pairs}")
     log.info(f"Timeframe: {TIMEFRAME} | Candles needed: {CANDLES_NEEDED}")
 
     while True:
@@ -708,33 +924,52 @@ def run():
             continue
 
         try:
+            p = db.get_all_params()
+            active_pairs = db.get_active_pairs()
+            fetch_pairs = active_pairs if BTC_PAIR in active_pairs else [BTC_PAIR] + active_pairs
+
             # ── 1. Fetch BTC 1h for regime ────────────────────────────────────
-            btc_1h_df = fetch_ohlcv(exchange, BTC_PAIR, "1h", limit=50)
+            btc_1h_df = fetch_ohlcv(exchange, BTC_PAIR, "1h", limit=CANDLES_1H)
             if btc_1h_df is not None:
                 btc_1h_df = compute_1h_indicators(btc_1h_df)
             btc_regime_label = btc_regime(btc_1h_df)
 
-            # ── 2. Fetch 5m candles for all pairs ─────────────────────────────
+            # ── 2. Fetch and cache candles for all active pairs ───────────────
             df5m: Dict[str, pd.DataFrame] = {}
+            df15m: Dict[str, pd.DataFrame] = {}
+            df1h: Dict[str, pd.DataFrame] = {}
+            df4h: Dict[str, pd.DataFrame] = {}
             current_prices: Dict[str, float] = {}
+            new_candle_pairs = set()
 
-            for pair in PAIRS:
+            for pair in fetch_pairs:
                 df = fetch_ohlcv(exchange, pair, TIMEFRAME, limit=CANDLES_NEEDED)
                 if df is None or len(df) < 30:
                     log.warning(f"Insufficient candles for {pair}, skipping")
                     continue
-                df = compute_indicators(df)
+                df = compute_indicators(df, p)
                 df5m[pair] = df
                 current_prices[pair] = float(df.iloc[-1]["close"])
+
+                df_15 = fetch_ohlcv(exchange, pair, "15m", limit=CANDLES_15M)
+                if df_15 is not None and len(df_15) >= 30:
+                    df15m[pair] = compute_1h_indicators(df_15)
+
+                df_1h = btc_1h_df if pair == BTC_PAIR else fetch_ohlcv(exchange, pair, "1h", limit=CANDLES_1H)
+                if df_1h is not None and len(df_1h) >= 30:
+                    df1h[pair] = compute_1h_indicators(df_1h) if pair != BTC_PAIR else df_1h
+
+                df_4h = fetch_ohlcv(exchange, pair, "4h", limit=CANDLES_4H)
+                if df_4h is not None and len(df_4h) >= 30:
+                    df4h[pair] = compute_1h_indicators(df_4h)
 
                 # Check if this is a new candle
                 last_ts = str(df.iloc[-1]["date"])
                 is_new  = last_candle_time.get(pair) != last_ts
                 last_candle_time[pair] = last_ts
-                if not is_new:
-                    continue   # skip signal eval — same candle as last loop
-
-                log.debug(f"New candle {pair} @ {last_ts} | close={current_prices[pair]:.4f}")
+                if is_new:
+                    new_candle_pairs.add(pair)
+                    log.debug(f"New candle {pair} @ {last_ts} | close={current_prices[pair]:.4f}")
 
             # ── 3. Manage open positions ──────────────────────────────────────
             open_trades = db.get_open_trades()
@@ -744,8 +979,12 @@ def run():
                 trade = next((t for t in open_trades if t["id"] == trade_id), None)
                 if not trade:
                     continue
-                close_order(exchange, trade["pair"], trade["side"],
-                            trade["amount"], exit_price, reason)
+                close_ok = close_order(exchange, trade["pair"], trade["side"],
+                                       trade["amount"], exit_price, reason,
+                                       trade.get("stop_order_id") or "")
+                if not close_ok:
+                    log.error(f"[Order] Trade #{trade_id} remains open because exchange close failed")
+                    continue
                 db.close_trade(trade_id, exit_price, reason)
                 trade_side = trade["side"]
                 stake      = trade["stake_usdt"]
@@ -775,38 +1014,51 @@ def run():
             open_pairs  = {t["pair"] for t in open_trades}
 
             # ── 4. Evaluate entry signals ─────────────────────────────────────
-            p = db.get_all_params()
             max_open  = int(p.get("max_open_trades", "3"))
             stake     = float(p.get("stake_usdt", "200"))
             leverage  = int(p.get("leverage", "5"))
 
             if len(open_trades) < max_open:
-                for pair in PAIRS:
+                for pair in active_pairs:
                     if pair not in df5m:
                         continue
+                    if pair not in new_candle_pairs:
+                        continue
+
+                    df = df5m[pair]
+                    p_regime = pair_1h_regime(df1h.get(pair))
+                    p15_regime = pair_1h_regime(df15m.get(pair))
+                    p4_regime = pair_1h_regime(df4h.get(pair))
 
                     # Skip if already have an open trade on this pair
                     if pair in open_pairs:
+                        log_decision_snapshot(
+                            pair, df, p, btc_regime_label, p15_regime, p_regime,
+                            p4_regime, "open_position", False, "open_position"
+                        )
                         continue
 
                     # Safety gate
                     ok, reason = safety_ok(pair, now)
                     if not ok:
                         log.debug(f"[Safety] {pair} blocked: {reason}")
+                        log_decision_snapshot(
+                            pair, df, p, btc_regime_label, p15_regime, p_regime,
+                            p4_regime, "safety_block", False, reason
+                        )
                         continue
 
-                    # Get 1h regime for this pair
-                    pair_1h_df = fetch_ohlcv(exchange, pair, "1h", limit=50)
-                    if pair_1h_df is not None:
-                        pair_1h_df = compute_1h_indicators(pair_1h_df)
-                    p_regime = pair_1h_regime(pair_1h_df)
-
                     # Check if this is a new candle for this pair
-                    df = df5m[pair]
                     last_ts = str(df.iloc[-1]["date"])
                     # (already checked above — if we're here it was new)
 
-                    sigs = evaluate_signals(pair, df, btc_regime_label, p_regime)
+                    sigs = evaluate_signals(pair, df, btc_regime_label, p_regime,
+                                            p15_regime, p4_regime, p)
+                    if not sigs:
+                        log_decision_snapshot(
+                            pair, df, p, btc_regime_label, p15_regime, p_regime,
+                            p4_regime, "no_signal", False, "no_signal"
+                        )
                     for sig in sigs:
                         if len(open_trades) >= max_open:
                             break
@@ -824,6 +1076,21 @@ def run():
                         order = place_order(exchange, pair, direction,
                                             stake, leverage, price)
                         if order:
+                            stop_id = place_exchange_stop(
+                                exchange, pair, direction,
+                                float(order.get("amount", 0) or 0), price
+                            )
+                            if not stop_id:
+                                close_order(exchange, pair, direction,
+                                            float(order.get("amount", 0) or 0),
+                                            price, "protective_stop_failed")
+                                log.error(f"[Order] Entry on {pair} immediately closed because protective stop failed")
+                                log_decision_snapshot(
+                                    pair, df, p, btc_regime_label, p15_regime,
+                                    p_regime, p4_regime, entry_tag, False,
+                                    "protective_stop_failed", {"signal": sig}
+                                )
+                                continue
                             trade_id = db.open_trade(
                                 pair=pair,
                                 side=direction,
@@ -836,6 +1103,13 @@ def run():
                                 btc_regime=btc_regime_label,
                                 atr_at_entry=sig["atr_pct"],
                                 dry_run=DRY_RUN,
+                                rsi_at_entry=sig["rsi"],
+                                vwap_dev_at_entry=sig["vwap_dev"],
+                                vol_ratio_at_entry=sig["vol_ratio"],
+                                bb_pct_at_entry=sig["bb_pct"],
+                                pair_regime=p_regime,
+                                exchange_order_id=order.get("id"),
+                                stop_order_id=stop_id,
                             )
                             tg.trade_opened(pair, direction, price, stake,
                                             leverage, entry_tag, DRY_RUN)
@@ -846,15 +1120,31 @@ def run():
                                 atr_pct=sig["atr_pct"], vwap_dev=sig["vwap_dev"],
                                 volume_ratio=sig["vol_ratio"],
                                 btc_regime=btc_regime_label, session=session,
+                                context={
+                                    "pair_15m_regime": p15_regime,
+                                    "pair_1h_regime": p_regime,
+                                    "pair_4h_regime": p4_regime,
+                                    "params": p,
+                                },
+                            )
+                            log_decision_snapshot(
+                                pair, df, p, btc_regime_label, p15_regime,
+                                p_regime, p4_regime, entry_tag, True, None,
+                                {"signal": sig, "trade_id": trade_id}
                             )
                             open_trades = db.get_open_trades()
                             open_pairs  = {t["pair"] for t in open_trades}
+                        else:
+                            log_decision_snapshot(
+                                pair, df, p, btc_regime_label, p15_regime,
+                                p_regime, p4_regime, entry_tag, False,
+                                "order_failed", {"signal": sig}
+                            )
 
             # ── 5. Check daily loss limit ─────────────────────────────────────
             total_profit = sum(
                 t.get("profit_usdt", 0) or 0
-                for t in db.get_all_closed_trades()
-                if t.get("exit_time", "")[:10] == now.date().isoformat()
+                for t in db.get_closed_trades_for_day(now.date().isoformat())
             )
             wallet_now = wallet_start + total_profit
             check_daily_loss(wallet_start, wallet_now)

@@ -307,7 +307,7 @@ def suggest_tuning(findings: Dict) -> Dict:
 def apply_suggestions(suggestions: Dict):
     """Write parameter suggestions to DB."""
     for key, value in suggestions.items():
-        db.set_param(key, value, updated_by="hermes")
+        db.set_validated_param(key, value, updated_by="hermes")
         log.info(f"[Hermes] Applied: {key} = {value}")
 
 
@@ -317,8 +317,6 @@ def run_once():
     try:
         findings    = analyse()
         suggestions = suggest_tuning(findings)
-
-        db.log_hermes(findings, suggestions)
 
         log.info(f"[Hermes] Trades analysed: {findings['total_trades']} | "
                  f"Win rate: {findings['overall_win_rate']:.1f}% | "
@@ -330,10 +328,15 @@ def run_once():
                          f"WR={stats['win_rate']:.1f}% | "
                          f"avg={stats['avg_profit']:+.2f} USDT")
 
-        if suggestions:
+        auto_apply = db.get_param("hermes_auto_apply", "false").lower() == "true"
+        db.log_hermes(findings, suggestions, applied=bool(suggestions and auto_apply))
+
+        if suggestions and auto_apply:
             log.info(f"[Hermes] Applying {len(suggestions)} parameter update(s)...")
             apply_suggestions(suggestions)
             tg.hermes_tuned(suggestions)
+        elif suggestions:
+            log.info(f"[Hermes] {len(suggestions)} suggestion(s) recorded for review; auto-apply disabled.")
         else:
             log.info("[Hermes] No parameter changes needed.")
 

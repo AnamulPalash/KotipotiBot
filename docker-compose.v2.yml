@@ -23,7 +23,7 @@ services:
     container_name: kotipotibot_dashboard
     restart: unless-stopped
     volumes:
-      - kotipoti_data:/data:ro   # read-only — dashboard never writes
+      - kotipoti_data:/data      # needs write access for SQLite WAL mode
     ports:
       - "5000:5000"
     env_file:

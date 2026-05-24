@@ -593,6 +593,14 @@ def index():
 
 
 if __name__ == "__main__":
-    db.init_db()
+    # Don't call init_db() here — the bot container owns schema creation.
+    # We just wait until the DB file exists before starting.
+    import time
+    db_path = os.environ.get("DB_PATH", "/data/kotipoti.db")
+    for _ in range(30):
+        if os.path.exists(db_path):
+            break
+        log.info(f"Waiting for DB at {db_path}...")
+        time.sleep(2)
     log.info(f"KotipotiBot Dashboard starting on port {PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)

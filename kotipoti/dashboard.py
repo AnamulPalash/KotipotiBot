@@ -57,6 +57,92 @@ def api_hermes():
         })
     return jsonify(result)
 
+@app.route("/api/charts")
+def api_charts():
+    """Pre-computed chart data so the frontend doesn't need to crunch numbers."""
+    trades = db.get_all_closed_trades()
+
+    # Cumulative P&L curve — one point per trade, sorted by exit time
+    sorted_trades = sorted(
+        [t for t in trades if t.get("exit_time") and t.get("profit_usdt") is not None],
+        key=lambda t: t["exit_time"]
+    )
+    cumulative = 0.0
+    pnl_curve = []
+    for t in sorted_trades:
+        cumulative += t["profit_usdt"]
+        pnl_curve.append({"t": t["exit_time"][:16], "v": round(cumulative, 2),
+                           "p": round(t["profit_usdt"], 2)})
+
+    # Win rate rolling (last 20 trades)
+    rolling_wr = []
+    for i, t in enumerate(sorted_trades):
+        window = sorted_trades[max(0, i-19):i+1]
+        wins = sum(1 for x in window if x["profit_usdt"] > 0)
+        rolling_wr.append({"t": t["exit_time"][:16],
+                            "v": round(wins / len(window) * 100, 1)})
+
+    # By session
+    from collections import defaultdict
+    sess: dict = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0.0})
+    for t in trades:
+        s = t.get("session") or "Unknown"
+        sess[s]["pnl"] += t.get("profit_usdt") or 0
+        if (t.get("profit_usdt") or 0) > 0:
+            sess[s]["wins"] += 1
+        else:
+            sess[s]["losses"] += 1
+    by_session = [
+        {"label": s,
+         "wins": v["wins"], "losses": v["losses"],
+         "pnl": round(v["pnl"], 2),
+         "wr": round(v["wins"] / max(v["wins"]+v["losses"], 1) * 100, 1)}
+        for s, v in sess.items()
+    ]
+
+    # By pair
+    pair_map: dict = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0.0})
+    for t in trades:
+        p = t["pair"].split("/")[0]
+        pair_map[p]["pnl"] += t.get("profit_usdt") or 0
+        if (t.get("profit_usdt") or 0) > 0:
+            pair_map[p]["wins"] += 1
+        else:
+            pair_map[p]["losses"] += 1
+    by_pair = sorted([
+        {"label": p,
+         "wins": v["wins"], "losses": v["losses"],
+         "pnl": round(v["pnl"], 2),
+         "wr": round(v["wins"] / max(v["wins"]+v["losses"], 1) * 100, 1)}
+        for p, v in pair_map.items()
+    ], key=lambda x: x["pnl"], reverse=True)
+
+    # By entry tag
+    tag_map: dict = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0.0})
+    for t in trades:
+        tag = t.get("entry_tag") or "unknown"
+        tag_map[tag]["pnl"] += t.get("profit_usdt") or 0
+        if (t.get("profit_usdt") or 0) > 0:
+            tag_map[tag]["wins"] += 1
+        else:
+            tag_map[tag]["losses"] += 1
+    by_tag = [
+        {"label": tag,
+         "wins": v["wins"], "losses": v["losses"],
+         "pnl": round(v["pnl"], 2),
+         "wr": round(v["wins"] / max(v["wins"]+v["losses"], 1) * 100, 1)}
+        for tag, v in tag_map.items()
+    ]
+
+    return jsonify({
+        "pnl_curve":   pnl_curve,
+        "rolling_wr":  rolling_wr,
+        "by_session":  by_session,
+        "by_pair":     by_pair,
+        "by_tag":      by_tag,
+    })
+
+
 @app.route("/health")
 def health():
     try:
@@ -71,14 +157,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>KotipotiBot v2</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
      background:linear-gradient(160deg,#0F172A 0%,#1A2540 100%);
      color:#F8FAFC;min-height:100vh;padding:1.5rem}
-.wrap{max-width:1400px;margin:0 auto}
+.wrap{max-width:1500px;margin:0 auto}
 h1{font-size:26px;font-weight:700;letter-spacing:-.5px}
 .subtitle{font-size:13px;color:#94A3B8;margin-top:4px}
 .header{display:flex;justify-content:space-between;align-items:flex-start;
@@ -87,6 +173,15 @@ h1{font-size:26px;font-weight:700;letter-spacing:-.5px}
 .badge{display:flex;align-items:center;gap:6px;border-radius:999px;
        padding:5px 12px;font-size:12px;font-weight:600}
 .badge-dot{width:7px;height:7px;border-radius:50%}
+/* Charts */
+.chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1rem}
+.chart-full{grid-column:1/-1}
+.chart-wrap{background:rgba(30,41,59,.85);border:1px solid rgba(148,163,184,.12);
+            border-radius:14px;padding:1.25rem}
+.chart-title{font-size:13px;font-weight:600;color:#E2E8F0;margin-bottom:12px}
+canvas{display:block;width:100%!important}
+.bar-label{font-size:11px;color:#94A3B8}
+.no-data{text-align:center;padding:40px 0;color:#475569;font-size:13px}
 .btn{background:rgba(59,130,246,.15);border:1px solid rgba(59,130,246,.3);
      color:#60A5FA;border-radius:8px;padding:6px 12px;font-size:12px;
      cursor:pointer;font-weight:500}
@@ -196,22 +291,24 @@ const fmtDur = s => {
 
 let state = {
   summary:{}, openTrades:[], recentTrades:[],
-  signals:[], params:{}, hermes:[],
+  signals:[], params:{}, hermes:[], charts:{},
   lastUpdated:null, activeTab:'overview'
 };
 
 async function fetchAll() {
   try {
-    const [sum, open, closed, sigs, params, hermes] = await Promise.all([
+    const [sum, open, closed, sigs, params, hermes, charts] = await Promise.all([
       fetch('/api/summary').then(r=>r.json()).catch(()=>({})),
       fetch('/api/open_trades').then(r=>r.json()).catch(()=>[]),
       fetch('/api/recent_trades').then(r=>r.json()).catch(()=>[]),
       fetch('/api/signals').then(r=>r.json()).catch(()=>[]),
       fetch('/api/params').then(r=>r.json()).catch(()=>({})),
       fetch('/api/hermes').then(r=>r.json()).catch(()=>[]),
+      fetch('/api/charts').then(r=>r.json()).catch(()=>({})),
     ]);
     state.summary=sum; state.openTrades=open; state.recentTrades=closed;
     state.signals=sigs; state.params=params; state.hermes=hermes;
+    state.charts=charts;
     state.lastUpdated=new Date();
   } catch(e) { console.error(e); }
   render();
@@ -288,6 +385,7 @@ function buildUI() {
   // Tabs
   const tabs = [
     {id:'overview',label:'📊 Overview'},
+    {id:'charts',  label:'📈 Charts'},
     {id:'open',    label:`📉 Open (${s.openTrades.length})`},
     {id:'closed',  label:'✅ Closed'},
     {id:'signals', label:'🔔 Signals'},
@@ -306,6 +404,7 @@ function buildUI() {
   const content = el('div',{});
   switch(state.activeTab) {
     case 'overview': content.appendChild(buildOverview()); break;
+    case 'charts':   content.appendChild(buildCharts());   break;
     case 'open':     content.appendChild(buildOpen());     break;
     case 'closed':   content.appendChild(buildClosed());   break;
     case 'signals':  content.appendChild(buildSignals());  break;
@@ -323,6 +422,152 @@ function kpiCard({label,value,valueClass='',sub='',border='rgba(148,163,184,.12)
   card.appendChild(el('div',{class:`kpi-value ${valueClass}`},value));
   card.appendChild(el('div',{class:'kpi-sub',html:sub}));
   return card;
+}
+
+// ── Pure-canvas chart helpers ──────────────────────────────────────────────
+
+function lineChart(data, {width=600,height=180,color='#3B82F6',fillColor='rgba(59,130,246,.08)',zeroLine=true}={}) {
+  if (!data || data.length < 2) { const d=document.createElement('div'); d.className='no-data'; d.textContent='Not enough data yet'; return d; }
+  const canvas=document.createElement('canvas');
+  canvas.width=width; canvas.height=height;
+  canvas.style.width='100%'; canvas.style.height=height+'px';
+  const ctx=canvas.getContext('2d');
+  const pad={t:10,r:10,b:28,l:52};
+  const W=width-pad.l-pad.r, H=height-pad.t-pad.b;
+  const vals=data.map(d=>d.v);
+  const minV=Math.min(...vals), maxV=Math.max(...vals);
+  const range=maxV-minV||1;
+  const xS=i=>pad.l+i/(data.length-1)*W;
+  const yS=v=>pad.t+H-(v-minV)/range*H;
+  ctx.clearRect(0,0,width,height);
+  if (zeroLine && minV<0 && maxV>0) {
+    ctx.strokeStyle='rgba(148,163,184,.2)'; ctx.lineWidth=1; ctx.setLineDash([4,4]);
+    const y0=yS(0); ctx.beginPath(); ctx.moveTo(pad.l,y0); ctx.lineTo(pad.l+W,y0); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.beginPath(); ctx.moveTo(xS(0),yS(vals[0]));
+  for (let i=1;i<data.length;i++) ctx.lineTo(xS(i),yS(vals[i]));
+  ctx.lineTo(xS(data.length-1),pad.t+H); ctx.lineTo(xS(0),pad.t+H); ctx.closePath();
+  ctx.fillStyle=fillColor; ctx.fill();
+  ctx.beginPath(); ctx.moveTo(xS(0),yS(vals[0]));
+  for (let i=1;i<data.length;i++) ctx.lineTo(xS(i),yS(vals[i]));
+  ctx.strokeStyle=color; ctx.lineWidth=2; ctx.stroke();
+  ctx.fillStyle='#475569'; ctx.font='10px sans-serif'; ctx.textAlign='right';
+  for (let i=0;i<=4;i++) {
+    const v=minV+(range/4)*i, y=yS(v);
+    ctx.fillText(v.toFixed(1),pad.l-4,y+3);
+    ctx.strokeStyle='rgba(148,163,184,.06)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(pad.l+W,y); ctx.stroke();
+  }
+  ctx.fillStyle='#475569'; ctx.textAlign='center'; ctx.font='9px sans-serif';
+  for (const i of [0,Math.floor(data.length/2),data.length-1])
+    ctx.fillText((data[i].t||'').slice(5), xS(i), height-6);
+  return canvas;
+}
+
+function barChart(data, {width=600,height=160,colorPos='#10B981',colorNeg='#EF4444',valueKey='pnl',labelKey='label'}={}) {
+  if (!data||!data.length) { const d=document.createElement('div'); d.className='no-data'; d.textContent='Not enough data yet'; return d; }
+  const canvas=document.createElement('canvas');
+  canvas.width=width; canvas.height=height;
+  canvas.style.width='100%'; canvas.style.height=height+'px';
+  const ctx=canvas.getContext('2d');
+  const pad={t:14,r:10,b:32,l:52};
+  const W=width-pad.l-pad.r, H=height-pad.t-pad.b;
+  const vals=data.map(d=>d[valueKey]);
+  const maxAbs=Math.max(...vals.map(Math.abs),0.01);
+  const barW=Math.max(8,W/data.length*0.6);
+  const gap=(W-barW*data.length)/(data.length+1);
+  const midY=pad.t+H/2;
+  ctx.clearRect(0,0,width,height);
+  ctx.strokeStyle='rgba(148,163,184,.2)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad.l,midY); ctx.lineTo(pad.l+W,midY); ctx.stroke();
+  data.forEach((d,i)=>{
+    const v=d[valueKey], x=pad.l+gap+(barW+gap)*i;
+    const bH=Math.abs(v)/maxAbs*(H/2-4);
+    ctx.fillStyle=v>=0?colorPos:colorNeg;
+    ctx.beginPath(); ctx.roundRect(x,v>=0?midY-bH:midY,barW,bH,3); ctx.fill();
+    ctx.fillStyle='#64748B'; ctx.font='10px sans-serif'; ctx.textAlign='center';
+    ctx.fillText(d[labelKey],x+barW/2,height-8);
+    ctx.fillStyle=v>=0?'#34D399':'#F87171'; ctx.font='bold 10px sans-serif';
+    ctx.fillText((v>=0?'+':'')+v.toFixed(1),x+barW/2,v>=0?midY-bH-4:midY+bH+12);
+  });
+  return canvas;
+}
+
+function winRateBar(wins,losses) {
+  const total=wins+losses; if(!total){const d=document.createElement('div');d.className='no-data';d.textContent='—';return d;}
+  const wr=wins/total*100;
+  const wrap=el('div',{style:'padding:2px 0'});
+  wrap.appendChild(el('div',{style:'display:flex;justify-content:space-between;margin-bottom:4px'},
+    el('span',{style:'font-size:11px;color:#94A3B8'},`${wins}W/${losses}L`),
+    el('span',{style:`font-size:12px;font-weight:700;color:${wr>=50?'#10B981':'#EF4444'}`},wr.toFixed(1)+'%')
+  ));
+  const track=el('div',{style:'height:6px;background:rgba(239,68,68,.2);border-radius:3px;overflow:hidden'});
+  track.appendChild(el('div',{style:`height:100%;width:${wr}%;background:linear-gradient(90deg,#10B981,#059669);border-radius:3px`}));
+  wrap.appendChild(track);
+  return wrap;
+}
+
+// ── Charts tab ────────────────────────────────────────────────────────────
+function buildCharts() {
+  const c=state.charts;
+  const wrap=el('div',{});
+
+  // P&L curve — full width
+  const pnlBox=el('div',{class:'chart-wrap',style:'margin-bottom:1rem'});
+  pnlBox.appendChild(el('div',{class:'chart-title'},'Cumulative P&L (USDT)'));
+  if (c.pnl_curve&&c.pnl_curve.length>=2) {
+    const last=c.pnl_curve[c.pnl_curve.length-1].v;
+    pnlBox.appendChild(lineChart(c.pnl_curve,{width:1200,height:200,
+      color:last>=0?'#10B981':'#EF4444',
+      fillColor:last>=0?'rgba(16,185,129,.08)':'rgba(239,68,68,.08)',
+      zeroLine:true}));
+  } else pnlBox.appendChild(el('div',{class:'no-data'},'Waiting for closed trades…'));
+  wrap.appendChild(pnlBox);
+
+  // Row 2: rolling win rate + by session
+  const row2=el('div',{class:'chart-grid'});
+  const wrBox=el('div',{class:'chart-wrap'});
+  wrBox.appendChild(el('div',{class:'chart-title'},'Rolling Win Rate % (last 20 trades)'));
+  if (c.rolling_wr&&c.rolling_wr.length>=2)
+    wrBox.appendChild(lineChart(c.rolling_wr,{width:600,height:160,color:'#A78BFA',fillColor:'rgba(167,139,250,.08)',zeroLine:false}));
+  else wrBox.appendChild(el('div',{class:'no-data'},'Waiting for closed trades…'));
+  row2.appendChild(wrBox);
+
+  const sessBox=el('div',{class:'chart-wrap'});
+  sessBox.appendChild(el('div',{class:'chart-title'},'P&L by Session (USDT)'));
+  if (c.by_session&&c.by_session.length) {
+    sessBox.appendChild(barChart(c.by_session,{width:600,height:160}));
+    const g=el('div',{style:'display:flex;gap:12px;margin-top:10px;flex-wrap:wrap'});
+    for (const s of c.by_session){const chip=el('div',{style:'flex:1;min-width:90px'});chip.appendChild(el('div',{style:'font-size:11px;color:#94A3B8;margin-bottom:3px'},s.label));chip.appendChild(winRateBar(s.wins,s.losses));g.appendChild(chip);}
+    sessBox.appendChild(g);
+  } else sessBox.appendChild(el('div',{class:'no-data'},'Waiting for closed trades…'));
+  row2.appendChild(sessBox);
+  wrap.appendChild(row2);
+
+  // Row 3: by pair + by tag
+  const row3=el('div',{class:'chart-grid'});
+  const pairBox=el('div',{class:'chart-wrap'});
+  pairBox.appendChild(el('div',{class:'chart-title'},'P&L by Pair (USDT)'));
+  if (c.by_pair&&c.by_pair.length) {
+    pairBox.appendChild(barChart(c.by_pair,{width:600,height:160}));
+    const g=el('div',{style:'display:flex;gap:10px;margin-top:10px;flex-wrap:wrap'});
+    for (const p of c.by_pair){const chip=el('div',{style:'flex:1;min-width:80px'});chip.appendChild(el('div',{style:'font-size:11px;color:#94A3B8;margin-bottom:3px'},p.label));chip.appendChild(winRateBar(p.wins,p.losses));g.appendChild(chip);}
+    pairBox.appendChild(g);
+  } else pairBox.appendChild(el('div',{class:'no-data'},'Waiting for closed trades…'));
+  row3.appendChild(pairBox);
+
+  const tagBox=el('div',{class:'chart-wrap'});
+  tagBox.appendChild(el('div',{class:'chart-title'},'P&L by Signal Type (USDT)'));
+  if (c.by_tag&&c.by_tag.length) {
+    tagBox.appendChild(barChart(c.by_tag,{width:600,height:160}));
+    const g=el('div',{style:'display:flex;gap:10px;margin-top:10px;flex-wrap:wrap'});
+    for (const t of c.by_tag){const chip=el('div',{style:'flex:1;min-width:100px'});chip.appendChild(el('div',{style:'font-size:11px;color:#94A3B8;margin-bottom:3px'},t.label));chip.appendChild(winRateBar(t.wins,t.losses));g.appendChild(chip);}
+    tagBox.appendChild(g);
+  } else tagBox.appendChild(el('div',{class:'no-data'},'Waiting for closed trades…'));
+  row3.appendChild(tagBox);
+  wrap.appendChild(row3);
+  return wrap;
 }
 
 function buildOverview() {

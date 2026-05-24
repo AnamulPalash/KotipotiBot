@@ -412,7 +412,7 @@ const el = (tag, attrs={}, ...children) => {
   }
   for (const c of children) {
     if (c==null) continue;
-    e.appendChild(typeof c==='string'?document.createTextNode(c):c);
+    e.appendChild((typeof c==='string'||typeof c==='number')?document.createTextNode(String(c)):c);
   }
   return e;
 };

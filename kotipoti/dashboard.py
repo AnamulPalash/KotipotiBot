@@ -5,15 +5,27 @@ Flask server. Reads directly from SQLite.
 Serves a self-contained vanilla JS dashboard — no CDN, no React.
 """
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-import os, sys, json, logging
+import os, sys, json, logging, hashlib, secrets
 from pathlib import Path
 
 import db
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Admin auth ────────────────────────────────────────────────────────────────
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "kotipoti")
+# Simple in-memory token store: token → True (single-user, resets on restart)
+_valid_tokens: set = set()
+
+def _check_auth() -> bool:
+    """Return True if the request carries a valid admin token."""
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Bearer "):
+        return header[7:] in _valid_tokens
+    return False
 
 PORT = int(os.environ.get("DASHBOARD_PORT", 5000))
 
@@ -143,6 +155,79 @@ def api_charts():
     })
 
 
+
+# ── Admin API routes ──────────────────────────────────────────────────────────
+
+@app.route("/api/admin/auth", methods=["POST"])
+def admin_auth():
+    data = request.get_json(silent=True) or {}
+    pw   = data.get("password", "")
+    if pw == ADMIN_PASSWORD:
+        token = secrets.token_hex(24)
+        _valid_tokens.add(token)
+        return jsonify({"ok": True, "token": token})
+    return jsonify({"ok": False, "error": "Wrong password"}), 401
+
+@app.route("/api/admin/bot/control", methods=["POST"])
+def admin_bot_control():
+    if not _check_auth():
+        return jsonify({"ok": False, "error": "Unauthorised"}), 403
+    data    = request.get_json(silent=True) or {}
+    action  = data.get("action", "")  # stop | pause | resume
+    if action not in ("stop", "pause", "resume"):
+        return jsonify({"ok": False, "error": "Unknown action"}), 400
+    cmd_id = db.send_command(action)
+    return jsonify({"ok": True, "command": action, "id": cmd_id})
+
+@app.route("/api/admin/pairs", methods=["POST"])
+def admin_pairs():
+    if not _check_auth():
+        return jsonify({"ok": False, "error": "Unauthorised"}), 403
+    data  = request.get_json(silent=True) or {}
+    pairs = data.get("pairs")  # full replacement list
+    if not isinstance(pairs, list) or not pairs:
+        return jsonify({"ok": False, "error": "Provide non-empty pairs list"}), 400
+    db.set_active_pairs(pairs)
+    db.send_command("update_pairs", {"pairs": pairs})
+    return jsonify({"ok": True, "pairs": pairs})
+
+@app.route("/api/admin/params", methods=["POST"])
+def admin_params():
+    if not _check_auth():
+        return jsonify({"ok": False, "error": "Unauthorised"}), 403
+    data = request.get_json(silent=True) or {}
+    updates = data.get("updates", {})
+    if not updates:
+        return jsonify({"ok": False, "error": "No updates provided"}), 400
+    for k, v in updates.items():
+        db.set_param(k, v, updated_by="admin")
+    return jsonify({"ok": True, "updated": list(updates.keys())})
+
+@app.route("/api/admin/force_close/<int:trade_id>", methods=["POST"])
+def admin_force_close(trade_id):
+    if not _check_auth():
+        return jsonify({"ok": False, "error": "Unauthorised"}), 403
+    cmd_id = db.send_command("force_close", {"trade_id": trade_id})
+    return jsonify({"ok": True, "trade_id": trade_id, "cmd_id": cmd_id})
+
+@app.route("/api/admin/commands")
+def admin_commands():
+    if not _check_auth():
+        return jsonify({"ok": False, "error": "Unauthorised"}), 403
+    return jsonify(db.get_recent_commands(30))
+
+@app.route("/api/admin/bot_state")
+def admin_bot_state():
+    if not _check_auth():
+        return jsonify({"ok": False, "error": "Unauthorised"}), 403
+    return jsonify({
+        "status":         db.get_bot_state("status", "unknown"),
+        "last_heartbeat": db.get_bot_state("last_heartbeat", ""),
+        "active_pairs":   db.get_active_pairs(),
+    })
+
+# ── Health ─────────────────────────────────────────────────────────────────────
+
 @app.route("/health")
 def health():
     try:
@@ -239,6 +324,57 @@ tbody tr:nth-child(even){background:rgba(51,65,85,.2)}
 .signal-fired{border-left:3px solid #10B981}
 .signal-skip{border-left:3px solid rgba(148,163,184,.3)}
 .footer{text-align:center;margin-top:2rem;font-size:11px;color:rgba(148,163,184,.35)}
+/* Admin styles */
+.admin-login{max-width:360px;margin:80px auto;text-align:center}
+.admin-login h2{font-size:22px;font-weight:700;margin-bottom:8px}
+.admin-login p{font-size:13px;color:#64748B;margin-bottom:24px}
+.input{background:rgba(30,41,59,.9);border:1px solid rgba(148,163,184,.2);
+       color:#F8FAFC;border-radius:8px;padding:10px 14px;font-size:14px;
+       width:100%;outline:none;transition:border .2s}
+.input:focus{border-color:rgba(59,130,246,.5)}
+.btn-primary{background:linear-gradient(135deg,#3B82F6,#2563EB);border:none;
+             color:#fff;border-radius:8px;padding:10px 20px;font-size:14px;
+             font-weight:600;cursor:pointer;width:100%;margin-top:12px}
+.btn-primary:hover{opacity:.9}
+.btn-danger{background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.3);
+            color:#F87171;border-radius:8px;padding:6px 14px;font-size:12px;
+            font-weight:600;cursor:pointer}
+.btn-danger:hover{background:rgba(239,68,68,.25)}
+.btn-warn{background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.3);
+          color:#FCD34D;border-radius:8px;padding:6px 14px;font-size:12px;
+          font-weight:600;cursor:pointer}
+.btn-warn:hover{background:rgba(245,158,11,.22)}
+.btn-green{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);
+           color:#34D399;border-radius:8px;padding:6px 14px;font-size:12px;
+           font-weight:600;cursor:pointer}
+.btn-green:hover{background:rgba(16,185,129,.22)}
+.btn-sm{padding:4px 10px;font-size:11px;border-radius:6px}
+.admin-section{margin-bottom:1.25rem}
+.admin-label{font-size:12px;font-weight:600;color:#94A3B8;
+             text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px}
+.pair-chip{display:inline-flex;align-items:center;gap:6px;
+           background:rgba(51,65,85,.6);border:1px solid rgba(148,163,184,.15);
+           border-radius:20px;padding:4px 10px 4px 12px;font-size:12px;
+           color:#E2E8F0;margin:3px}
+.pair-x{background:none;border:none;color:#94A3B8;cursor:pointer;font-size:14px;
+        line-height:1;padding:0 2px}
+.pair-x:hover{color:#F87171}
+.ctrl-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.status-pill{display:inline-flex;align-items:center;gap:5px;
+             border-radius:999px;padding:5px 14px;font-size:12px;font-weight:700}
+.param-edit-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}
+.param-edit-row{display:flex;flex-direction:column;gap:4px}
+.param-edit-label{font-size:10px;color:#64748B;text-transform:uppercase;letter-spacing:.5px}
+.param-edit-input{background:rgba(30,41,59,.9);border:1px solid rgba(148,163,184,.15);
+                  color:#F8FAFC;border-radius:6px;padding:6px 10px;font-size:13px;
+                  outline:none;width:100%}
+.param-edit-input:focus{border-color:rgba(59,130,246,.4)}
+.cmd-row{display:flex;align-items:center;gap:8px;padding:6px 10px;
+         border-radius:7px;background:rgba(51,65,85,.35);margin-bottom:4px;font-size:12px}
+.cmd-done{color:#34D399}.cmd-error{color:#F87171}.cmd-pending{color:#FCD34D}
+.alert{padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:12px}
+.alert-ok{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.25);color:#34D399}
+.alert-err{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.25);color:#F87171}
 .spinner{width:36px;height:36px;border:3px solid rgba(148,163,184,.2);
          border-top:3px solid #3B82F6;border-radius:50%;
          animation:spin .8s linear infinite;margin:0 auto}
@@ -292,27 +428,15 @@ const fmtDur = s => {
 let state = {
   summary:{}, openTrades:[], recentTrades:[],
   signals:[], params:{}, hermes:[], charts:{},
-  lastUpdated:null, activeTab:'overview'
+  lastUpdated:null, activeTab:'overview',
+  // Admin
+  adminToken: sessionStorage.getItem('adminToken')||null,
+  adminState: {},   // bot_state + pairs fetched after login
+  adminCmds:  [],
+  adminAlert: null, // {type:'ok'|'err', msg}
+  adminParamEdits: {}, // live edits before save
+  adminNewPair: '',
 };
-
-async function fetchAll() {
-  try {
-    const [sum, open, closed, sigs, params, hermes, charts] = await Promise.all([
-      fetch('/api/summary').then(r=>r.json()).catch(()=>({})),
-      fetch('/api/open_trades').then(r=>r.json()).catch(()=>[]),
-      fetch('/api/recent_trades').then(r=>r.json()).catch(()=>[]),
-      fetch('/api/signals').then(r=>r.json()).catch(()=>[]),
-      fetch('/api/params').then(r=>r.json()).catch(()=>({})),
-      fetch('/api/hermes').then(r=>r.json()).catch(()=>[]),
-      fetch('/api/charts').then(r=>r.json()).catch(()=>({})),
-    ]);
-    state.summary=sum; state.openTrades=open; state.recentTrades=closed;
-    state.signals=sigs; state.params=params; state.hermes=hermes;
-    state.charts=charts;
-    state.lastUpdated=new Date();
-  } catch(e) { console.error(e); }
-  render();
-}
 
 function render() {
   const app = document.getElementById('app');
@@ -391,6 +515,7 @@ function buildUI() {
     {id:'signals', label:'🔔 Signals'},
     {id:'hermes',  label:'🧠 Hermes'},
     {id:'params',  label:'⚙️ Params'},
+    {id:'admin',   label:'🔐 Admin'},
   ];
   const tabBar = el('div',{class:'tabs'});
   for (const t of tabs) {
@@ -410,6 +535,7 @@ function buildUI() {
     case 'signals':  content.appendChild(buildSignals());  break;
     case 'hermes':   content.appendChild(buildHermes());   break;
     case 'params':   content.appendChild(buildParams());   break;
+    case 'admin':    content.appendChild(buildAdmin());    break;
   }
   wrap.appendChild(content);
   wrap.appendChild(el('p',{class:'footer'},'KotipotiBot v2 · auto-refreshes every 30s · read-only'));
@@ -823,6 +949,351 @@ function buildParams() {
   }
   card.appendChild(grid);
   return card;
+}
+
+// ── Admin helpers ─────────────────────────────────────────────────────────────
+
+async function adminFetch(path, opts={}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer '+(state.adminToken||''),
+      ...(opts.headers||{})
+    }
+  });
+  return res.json();
+}
+
+async function refreshAdminState() {
+  if (!state.adminToken) return;
+  const [s, c] = await Promise.all([
+    adminFetch('/api/admin/bot_state'),
+    adminFetch('/api/admin/commands'),
+  ]);
+  if (s.ok !== false) state.adminState = s;
+  if (Array.isArray(c)) state.adminCmds = c;
+}
+
+function buildAdmin() {
+  const wrap = el('div',{});
+
+  // Not logged in → show login form
+  if (!state.adminToken) {
+    const box = el('div',{class:'admin-login'});
+    box.appendChild(el('div',{style:'font-size:40px;margin-bottom:12px'},'🔐'));
+    box.appendChild(el('h2',{},'Admin Panel'));
+    box.appendChild(el('p',{},'Enter your admin password to continue'));
+
+    if (state.adminAlert) {
+      box.appendChild(el('div',{class:`alert alert-${state.adminAlert.type}`},
+        state.adminAlert.msg));
+    }
+
+    const pwInput = el('input',{class:'input',type:'password',placeholder:'Admin password…'});
+    const loginBtn = el('button',{class:'btn-primary'}, 'Unlock');
+
+    const doLogin = async () => {
+      const res = await fetch('/api/admin/auth', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({password: pwInput.value})
+      }).then(r=>r.json());
+      if (res.ok) {
+        state.adminToken = res.token;
+        sessionStorage.setItem('adminToken', res.token);
+        state.adminAlert = null;
+        await refreshAdminState();
+      } else {
+        state.adminAlert = {type:'err', msg:'❌ Wrong password'};
+      }
+      render();
+    };
+    pwInput.addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
+    loginBtn.addEventListener('click', doLogin);
+    box.appendChild(pwInput);
+    box.appendChild(loginBtn);
+    wrap.appendChild(box);
+    return wrap;
+  }
+
+  // ── Logged in ──────────────────────────────────────────────────────────────
+  const s  = state.adminState;
+  const pairs = Array.isArray(s.active_pairs) ? s.active_pairs : db_active_pairs_fallback();
+
+  // Header row with logout
+  const hdr = el('div',{style:'display:flex;justify-content:space-between;align-items:center;margin-bottom:1.25rem'});
+  hdr.appendChild(el('div',{},
+    el('h2',{style:'font-size:18px;font-weight:700'},'🔐 Admin Panel'),
+    el('p',{style:'font-size:12px;color:#64748B;margin-top:2px'},'Changes take effect immediately via command queue')
+  ));
+  hdr.appendChild(el('button',{class:'btn',onclick:()=>{
+    state.adminToken=null;
+    sessionStorage.removeItem('adminToken');
+    state.adminAlert=null;
+    render();
+  }},'🚪 Logout'));
+  wrap.appendChild(hdr);
+
+  if (state.adminAlert) {
+    const alert = el('div',{class:`alert alert-${state.adminAlert.type}`},state.adminAlert.msg);
+    wrap.appendChild(alert);
+    setTimeout(()=>{ state.adminAlert=null; render(); }, 4000);
+  }
+
+  const grid = el('div',{style:'display:grid;grid-template-columns:1fr 1fr;gap:1.25rem'});
+
+  // ── Bot Control ────────────────────────────────────────────────────────────
+  const ctrlCard = el('div',{class:'card'});
+  ctrlCard.appendChild(el('div',{class:'card-title'},'⚙️ Bot Control'));
+
+  const statusVal = s.status||'unknown';
+  const dotCol = statusVal==='running'?'#10B981':statusVal==='paused'?'#FCD34D':'#EF4444';
+  const hbAgo  = s.last_heartbeat
+    ? Math.round((Date.now()-new Date(s.last_heartbeat).getTime())/1000)+'s ago'
+    : '—';
+  ctrlCard.appendChild(el('div',{style:'display:flex;align-items:center;gap:10px;margin-bottom:16px'},
+    el('div',{style:`width:10px;height:10px;border-radius:50%;background:${dotCol};box-shadow:0 0 6px ${dotCol}`}),
+    el('span',{style:'font-size:15px;font-weight:700;color:#F8FAFC'},statusVal.toUpperCase()),
+    el('span',{style:'font-size:12px;color:#64748B'},'Last heartbeat: '+hbAgo)
+  ));
+
+  const sendCtrl = async (action, label) => {
+    const res = await adminFetch('/api/admin/bot/control', {
+      method:'POST', body:JSON.stringify({action})
+    });
+    if (res.ok) {
+      state.adminAlert = {type:'ok', msg:`✅ Command "${label}" queued (id #${res.id})`};
+    } else {
+      state.adminAlert = {type:'err', msg:'❌ '+res.error};
+    }
+    await refreshAdminState();
+    render();
+  };
+
+  const ctrlRow = el('div',{class:'ctrl-row'});
+  ctrlRow.appendChild(el('button',{class:'btn-green',
+    onclick:()=>sendCtrl('resume','Resume')},'▶ Resume'));
+  ctrlRow.appendChild(el('button',{class:'btn-warn',
+    onclick:()=>sendCtrl('pause','Pause')},'⏸ Pause'));
+  ctrlRow.appendChild(el('button',{class:'btn-danger',
+    onclick:()=>{
+      if(confirm('Stop the bot? It will exit after the current loop.')) sendCtrl('stop','Stop');
+    }},'⏹ Stop'));
+  ctrlCard.appendChild(ctrlRow);
+  grid.appendChild(ctrlCard);
+
+  // ── Active Pairs ───────────────────────────────────────────────────────────
+  const pairsCard = el('div',{class:'card'});
+  pairsCard.appendChild(el('div',{class:'card-title'},'💱 Active Pairs'));
+  pairsCard.appendChild(el('p',{style:'font-size:12px;color:#64748B;margin-bottom:10px'},
+    'Format: BTC/USDT:USDT · changes take ~1 min'));
+
+  const pairList = el('div',{style:'margin-bottom:12px;min-height:32px'});
+  const renderPairs = (pairArr) => {
+    pairList.innerHTML='';
+    for (const p of pairArr) {
+      const chip = el('span',{class:'pair-chip'}, p);
+      const x = el('button',{class:'pair-x',title:'Remove'}, '×');
+      x.addEventListener('click', async () => {
+        const newPairs = pairArr.filter(pp=>pp!==p);
+        const res = await adminFetch('/api/admin/pairs',{
+          method:'POST', body:JSON.stringify({pairs:newPairs})
+        });
+        if (res.ok) {
+          state.adminAlert={type:'ok',msg:'✅ Pair removed: '+p};
+          await refreshAdminState();
+        } else {
+          state.adminAlert={type:'err',msg:'❌ '+res.error};
+        }
+        render();
+      });
+      chip.appendChild(x);
+      pairList.appendChild(chip);
+    }
+  };
+  renderPairs(pairs);
+  pairsCard.appendChild(pairList);
+
+  const addRow = el('div',{style:'display:flex;gap:8px'});
+  const pairInput = el('input',{class:'input',placeholder:'SOL/USDT:USDT',
+    style:'flex:1;padding:7px 12px;font-size:13px'});
+  pairInput.value = state.adminNewPair;
+  pairInput.addEventListener('input', e=>{ state.adminNewPair=e.target.value; });
+  const addBtn = el('button',{class:'btn-primary',style:'width:auto;margin-top:0;padding:7px 16px;font-size:13px'},
+    '+ Add');
+  addBtn.addEventListener('click', async () => {
+    const newPair = (state.adminNewPair||'').trim().toUpperCase();
+    if (!newPair) return;
+    const newPairs = [...pairs, newPair];
+    const res = await adminFetch('/api/admin/pairs',{
+      method:'POST', body:JSON.stringify({pairs:newPairs})
+    });
+    if (res.ok) {
+      state.adminAlert={type:'ok',msg:'✅ Pair added: '+newPair};
+      state.adminNewPair='';
+      await refreshAdminState();
+    } else {
+      state.adminAlert={type:'err',msg:'❌ '+res.error};
+    }
+    render();
+  });
+  addRow.appendChild(pairInput);
+  addRow.appendChild(addBtn);
+  pairsCard.appendChild(addRow);
+  grid.appendChild(pairsCard);
+
+  wrap.appendChild(grid);
+
+  // ── Open Trades — Force Close ──────────────────────────────────────────────
+  const openCard = el('div',{class:'card',style:'margin-top:0'});
+  openCard.appendChild(el('div',{class:'card-title'},'📉 Open Positions — Force Close'));
+  if (!state.openTrades.length) {
+    openCard.appendChild(el('p',{class:'empty'},'No open positions'));
+  } else {
+    const tbl = el('table',{});
+    tbl.appendChild(el('thead',{},el('tr',{},
+      el('th',{class:'left'},'#'),el('th',{class:'left'},'Pair'),el('th',{},'Dir'),
+      el('th',{},'Entry'),el('th',{},'Stake'),el('th',{},'Holding'),el('th',{},'Action')
+    )));
+    const tb = el('tbody',{});
+    for (const t of state.openTrades) {
+      const fc = el('button',{class:'btn-danger btn-sm'},'Force Close');
+      fc.addEventListener('click', async ()=>{
+        if (!confirm(`Force close trade #${t.id} (${t.pair})?`)) return;
+        const res = await adminFetch(`/api/admin/force_close/${t.id}`,{method:'POST'});
+        if (res.ok) {
+          state.adminAlert={type:'ok',msg:`✅ Force-close queued for trade #${t.id}`};
+        } else {
+          state.adminAlert={type:'err',msg:'❌ '+res.error};
+        }
+        render();
+      });
+      tb.appendChild(el('tr',{},
+        el('td',{class:'left',style:'color:#64748B;font-size:11px'},'#'+t.id),
+        el('td',{class:'left',style:'font-weight:600'},t.pair),
+        el('td',{},el('span',{class:t.side==='short'?'dir-short':'dir-long'},t.side.toUpperCase())),
+        el('td',{},fmt(t.entry_price,4)),
+        el('td',{},fmt(t.stake_usdt,0)+' USDT'),
+        el('td',{},holdDur(t.entry_time)),
+        el('td',{},fc)
+      ));
+    }
+    tbl.appendChild(tb);
+    openCard.appendChild(el('div',{class:'overflow-x'},tbl));
+  }
+  wrap.appendChild(openCard);
+
+  // ── Strategy Parameters Editor ────────────────────────────────────────────
+  const paramCard = el('div',{class:'card'});
+  paramCard.appendChild(el('div',{class:'card-title'},'⚙️ Strategy Parameters'));
+  paramCard.appendChild(el('p',{style:'font-size:12px;color:#64748B;margin-bottom:12px'},
+    'Edit values below then click Save. Hermes may override these automatically.'));
+
+  const paramGroups = {
+    'Signal Thresholds': ['rsi_short_entry','rsi_long_entry','rsi_exit_short','rsi_exit_long','volume_multiplier','vwap_dev_min'],
+    'Bollinger / EMA':   ['bb_period','bb_std','ema_fast','ema_slow'],
+    'ATR Filter':        ['atr_period','atr_min_pct','atr_max_pct'],
+    'Risk / Position':   ['stoploss_pct','trailing_pct','trailing_offset','leverage','max_open_trades','stake_usdt'],
+    'Circuit Breakers':  ['daily_loss_limit','max_consec_losses','pair_cooldown_min','blocked_sessions'],
+  };
+
+  for (const [groupName, keys] of Object.entries(paramGroups)) {
+    const grpWrap = el('div',{class:'admin-section'});
+    grpWrap.appendChild(el('div',{class:'admin-label'},groupName));
+    const pgrid = el('div',{class:'param-edit-grid'});
+    for (const k of keys) {
+      const curVal = state.adminParamEdits[k] !== undefined
+        ? state.adminParamEdits[k]
+        : (state.params[k]||'');
+      const row = el('div',{class:'param-edit-row'});
+      row.appendChild(el('label',{class:'param-edit-label'},k.replace(/_/g,' ')));
+      const inp = el('input',{class:'param-edit-input', value: curVal});
+      inp.addEventListener('input', e=>{
+        state.adminParamEdits[k] = e.target.value;
+      });
+      row.appendChild(inp);
+      pgrid.appendChild(row);
+    }
+    grpWrap.appendChild(pgrid);
+    paramCard.appendChild(grpWrap);
+  }
+
+  const saveBtn = el('button',{class:'btn-primary',style:'width:auto;margin-top:4px;padding:9px 24px'},
+    '💾 Save Parameters');
+  saveBtn.addEventListener('click', async ()=>{
+    const edits = state.adminParamEdits;
+    if (!Object.keys(edits).length) {
+      state.adminAlert={type:'err',msg:'No changes to save'};
+      render();
+      return;
+    }
+    const res = await adminFetch('/api/admin/params',{
+      method:'POST', body:JSON.stringify({updates: edits})
+    });
+    if (res.ok) {
+      state.adminAlert={type:'ok',msg:`✅ Saved ${res.updated.length} parameter(s)`};
+      state.adminParamEdits={};
+      await fetchAll();
+    } else {
+      state.adminAlert={type:'err',msg:'❌ '+res.error};
+    }
+    render();
+  });
+  paramCard.appendChild(saveBtn);
+  wrap.appendChild(paramCard);
+
+  // ── Recent Commands ────────────────────────────────────────────────────────
+  const cmdsCard = el('div',{class:'card'});
+  cmdsCard.appendChild(el('div',{class:'card-title'},'📋 Recent Commands'));
+  const cmds = state.adminCmds;
+  if (!cmds.length) {
+    cmdsCard.appendChild(el('p',{class:'empty'},'No commands yet'));
+  } else {
+    for (const c of cmds.slice(0,15)) {
+      const statusCls = c.status==='done'?'cmd-done':c.status==='error'?'cmd-error':'cmd-pending';
+      const icon = c.status==='done'?'✅':c.status==='error'?'❌':'⏳';
+      cmdsCard.appendChild(el('div',{class:'cmd-row'},
+        el('span',{style:'color:#64748B;font-size:11px;min-width:80px'},
+          new Date(c.ts).toLocaleTimeString()),
+        el('span',{style:'font-size:12px;color:#E2E8F0;font-weight:600'},c.command),
+        el('span',{class:statusCls},icon+' '+c.status),
+        c.result?el('span',{style:'color:#94A3B8;font-size:11px;flex:1;text-align:right'},c.result):null
+      ));
+    }
+  }
+  cmdsCard.appendChild(el('button',{class:'btn',style:'margin-top:8px;font-size:11px',
+    onclick: async()=>{ await refreshAdminState(); render(); }
+  },'↻ Refresh'));
+  wrap.appendChild(cmdsCard);
+
+  return wrap;
+}
+
+function db_active_pairs_fallback() {
+  // Fallback if admin state not loaded yet
+  return ["BTC/USDT:USDT","ETH/USDT:USDT","SOL/USDT:USDT","DOGE/USDT:USDT","XRP/USDT:USDT"];
+}
+
+// Auto-refresh admin state when on admin tab
+async function fetchAll() {
+  try {
+    const [sum, open, closed, sigs, params, hermes, charts] = await Promise.all([
+      fetch('/api/summary').then(r=>r.json()).catch(()=>({})),
+      fetch('/api/open_trades').then(r=>r.json()).catch(()=>[]),
+      fetch('/api/recent_trades').then(r=>r.json()).catch(()=>[]),
+      fetch('/api/signals').then(r=>r.json()).catch(()=>[]),
+      fetch('/api/params').then(r=>r.json()).catch(()=>({})),
+      fetch('/api/hermes').then(r=>r.json()).catch(()=>[]),
+      fetch('/api/charts').then(r=>r.json()).catch(()=>({})),
+    ]);
+    state.summary=sum; state.openTrades=open; state.recentTrades=closed;
+    state.signals=sigs; state.params=params; state.hermes=hermes;
+    state.charts=charts;
+    state.lastUpdated=new Date();
+    if (state.activeTab==='admin') await refreshAdminState();
+  } catch(e) { console.error(e); }
+  render();
 }
 
 fetchAll();

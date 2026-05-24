@@ -67,6 +67,8 @@ _daily_loss_halted: bool = False
 _daily_loss_reset_day: Optional[int] = None
 _pair_last_loss: Dict[str, datetime] = {}   # pair -> time of last losing exit
 _api_error_times: List[datetime] = []
+_bot_paused: bool = False
+_bot_stopped: bool = False
 
 
 # ── Exchange setup ────────────────────────────────────────────────────────────
@@ -589,6 +591,74 @@ def close_order(exchange: ccxt.bybit, pair: str, side: str, amount: float,
         log.error(f"[Order] Failed to close {side} on {pair}: {e}")
 
 
+# ── Admin command processor ───────────────────────────────────────────────────
+
+def _process_commands(exchange: ccxt.bybit):
+    """Process any pending admin commands from the DB command queue."""
+    global _bot_paused, _bot_stopped
+
+    for cmd in db.get_pending_commands():
+        command = cmd["command"]
+        cmd_id  = cmd["id"]
+        payload = json.loads(cmd["payload"]) if cmd.get("payload") else {}
+
+        try:
+            if command == "stop":
+                _bot_stopped = True
+                db.ack_command(cmd_id, "done", "Bot stopped")
+                log.warning("[Admin] STOP command received")
+
+            elif command == "pause":
+                _bot_paused = True
+                db.ack_command(cmd_id, "done", "Bot paused")
+                log.warning("[Admin] PAUSE command received — new entries halted")
+
+            elif command == "resume":
+                _bot_paused = False
+                db.ack_command(cmd_id, "done", "Bot resumed")
+                log.info("[Admin] RESUME command received")
+
+            elif command == "force_close":
+                trade_id = payload.get("trade_id")
+                if not trade_id:
+                    db.ack_command(cmd_id, "error", "Missing trade_id")
+                    continue
+                open_trades = db.get_open_trades()
+                trade = next((t for t in open_trades if t["id"] == trade_id), None)
+                if not trade:
+                    db.ack_command(cmd_id, "error", f"Trade {trade_id} not found or not open")
+                    continue
+                # Fetch current price
+                try:
+                    ticker = exchange.fetch_ticker(trade["pair"])
+                    price  = float(ticker["last"])
+                except Exception as e:
+                    price = trade["entry_price"]
+                    log.warning(f"[Admin] Could not fetch price for force close: {e}")
+                close_order(exchange, trade["pair"], trade["side"],
+                            trade["amount"], price, "admin_force_close")
+                db.close_trade(trade_id, price, "force_close", "admin")
+                db.ack_command(cmd_id, "done",
+                               f"Force closed trade {trade_id} @ {price:.4f}")
+                log.warning(f"[Admin] Force closed trade #{trade_id} {trade['pair']} @ {price}")
+
+            elif command == "update_pairs":
+                pairs = payload.get("pairs", [])
+                if pairs:
+                    db.set_active_pairs(pairs)
+                    db.ack_command(cmd_id, "done", f"Pairs updated: {pairs}")
+                    log.info(f"[Admin] Active pairs updated: {pairs}")
+                else:
+                    db.ack_command(cmd_id, "error", "Empty pairs list")
+
+            else:
+                db.ack_command(cmd_id, "error", f"Unknown command: {command}")
+
+        except Exception as e:
+            log.error(f"[Admin] Error processing command {command}: {e}")
+            db.ack_command(cmd_id, "error", str(e))
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run():
@@ -612,6 +682,22 @@ def run():
     while True:
         loop_start = time.time()
         now = datetime.now(timezone.utc)
+
+        # ── 0. Process admin commands ─────────────────────────────────────────
+        global _bot_paused, _bot_stopped
+        _process_commands(exchange)
+        if _bot_stopped:
+            log.info("[Bot] Stop command received — exiting loop.")
+            break
+
+        # Update bot state heartbeat for dashboard
+        db.set_bot_state("status", "paused" if _bot_paused else "running")
+        db.set_bot_state("last_heartbeat", now.isoformat())
+
+        if _bot_paused:
+            log.info("[Bot] Paused — skipping signal evaluation.")
+            time.sleep(30)
+            continue
 
         try:
             # ── 1. Fetch BTC 1h for regime ────────────────────────────────────

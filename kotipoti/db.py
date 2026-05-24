@@ -81,6 +81,20 @@ def init_db():
             applied     INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS commands (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          TEXT NOT NULL,
+            command     TEXT NOT NULL,          -- 'stop','pause','resume','force_close'
+            payload     TEXT,                   -- JSON: e.g. {"trade_id": 5}
+            status      TEXT NOT NULL DEFAULT 'pending',  -- 'pending','done','error'
+            result      TEXT                    -- outcome message
+        );
+
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_trades_pair    ON trades(pair);
         CREATE INDEX IF NOT EXISTS idx_trades_open    ON trades(is_open);
         CREATE INDEX IF NOT EXISTS idx_signals_ts     ON signals(ts);
@@ -278,6 +292,71 @@ def get_profit_summary() -> Dict:
         "best_trade":        round(max(profits), 4),
         "worst_trade":       round(min(profits), 4),
     }
+
+
+# ── Command queue (admin → bot) ───────────────────────────────────────────────
+
+def send_command(command: str, payload: dict = None) -> int:
+    """Queue a command for the bot to pick up. Returns command id."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO commands(ts, command, payload, status) VALUES (?,?,?,?)",
+            (_now(), command, json.dumps(payload) if payload else None, "pending")
+        )
+        return cur.lastrowid
+
+def get_pending_commands() -> List[Dict]:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM commands WHERE status='pending' ORDER BY id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def ack_command(cmd_id: int, status: str = "done", result: str = ""):
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE commands SET status=?, result=? WHERE id=?",
+            (status, result, cmd_id)
+        )
+
+def get_recent_commands(limit: int = 20) -> List[Dict]:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM commands ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Bot state ─────────────────────────────────────────────────────────────────
+
+def set_bot_state(key: str, value: str):
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO bot_state(key, value) VALUES (?,?)",
+            (key, value)
+        )
+
+def get_bot_state(key: str, default: str = "") -> str:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_state WHERE key=?", (key,)
+        ).fetchone()
+    return row["value"] if row else default
+
+
+# ── Active pairs ──────────────────────────────────────────────────────────────
+
+def get_active_pairs() -> List[str]:
+    raw = get_param("active_pairs", "")
+    if not raw:
+        return [
+            "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+            "DOGE/USDT:USDT", "XRP/USDT:USDT"
+        ]
+    return json.loads(raw)
+
+def set_active_pairs(pairs: List[str]):
+    set_param("active_pairs", json.dumps(pairs), updated_by="admin")
 
 
 # ── Util ──────────────────────────────────────────────────────────────────────

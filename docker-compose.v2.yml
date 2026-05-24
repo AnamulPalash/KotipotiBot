@@ -1,0 +1,45 @@
+services:
+
+  bot:
+    build: ./kotipoti
+    image: kotipotibot_v2
+    container_name: kotipotibot_bot
+    restart: unless-stopped
+    volumes:
+      - kotipoti_data:/data
+    env_file:
+      - .env
+    environment:
+      DRY_RUN: "true"          # Change to "false" for live trading
+      DB_PATH: "/data/kotipoti.db"
+      LOG_LEVEL: "INFO"
+    command: python main.py
+    networks:
+      - kotipoti_net
+
+  dashboard:
+    build: ./kotipoti
+    image: kotipotibot_v2
+    container_name: kotipotibot_dashboard
+    restart: unless-stopped
+    volumes:
+      - kotipoti_data:/data:ro   # read-only — dashboard never writes
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      DB_PATH: "/data/kotipoti.db"
+      DASHBOARD_PORT: "5000"
+    command: python dashboard.py
+    depends_on:
+      - bot
+    networks:
+      - kotipoti_net
+
+networks:
+  kotipoti_net:
+    driver: bridge
+
+volumes:
+  kotipoti_data:   # Shared SQLite DB between bot and dashboard

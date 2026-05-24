@@ -235,6 +235,15 @@ def admin_bot_state():
 
 # ── Health ─────────────────────────────────────────────────────────────────────
 
+@app.route("/api/indicators")
+def api_indicators():
+    try:
+        raw = db.get_bot_state("indicators", "{}")
+        regime = db.get_bot_state("btc_regime", "unknown")
+        return jsonify({"pairs": json.loads(raw), "btc_regime": regime})
+    except Exception as e:
+        return jsonify({"pairs": {}, "btc_regime": "unknown"})
+
 @app.route("/health")
 def health():
     try:
@@ -434,7 +443,7 @@ const fmtDur = s => {
 
 let state = {
   summary:{}, openTrades:[], recentTrades:[],
-  signals:[], params:{}, hermes:[], charts:{},
+  signals:[], params:{}, hermes:[], charts:{}, indicators:{},
   lastUpdated:null, activeTab:'overview',
   // Admin
   adminToken: sessionStorage.getItem('adminToken')||null,
@@ -704,7 +713,66 @@ function buildCharts() {
 }
 
 function buildOverview() {
-  const wrap = el('div',{class:'two-col'});
+  const wrap = el('div',{});
+
+  // ── Live indicators card ───────────────────────────────────────────────────
+  const ind = state.indicators || {};
+  const pairs = ind.pairs || {};
+  const regime = ind.btc_regime || 'unknown';
+  const regimeCol = regime==='bull'?'#10B981':regime==='bear'?'#EF4444':'#FCD34D';
+
+  const ic = el('div',{class:'card'});
+  ic.appendChild(el('div',{style:'display:flex;justify-content:space-between;align-items:center;margin-bottom:12px'},
+    el('div',{class:'card-title',style:'margin-bottom:0'},'📡 Live Indicators'),
+    el('div',{style:`font-size:12px;font-weight:700;padding:3px 10px;border-radius:20px;
+        background:rgba(30,41,59,.8);border:1px solid ${regimeCol};color:${regimeCol}`},
+      'BTC: '+regime.toUpperCase())
+  ));
+
+  if (!Object.keys(pairs).length) {
+    ic.appendChild(el('p',{class:'empty'},'Waiting for first bot loop…'));
+  } else {
+    const tbl = el('table',{});
+    tbl.appendChild(el('thead',{},el('tr',{},
+      el('th',{class:'left'},'Pair'),
+      el('th',{},'Price'),
+      el('th',{},'RSI'),
+      el('th',{},'ATR%'),
+      el('th',{},'VWAP dev'),
+      el('th',{},'Vol ratio'),
+      el('th',{},'BB pos'),
+      el('th',{},'EMA'),
+    )));
+    const tb = el('tbody',{});
+    for (const [pair, d] of Object.entries(pairs)) {
+      const rsiCol = d.rsi>70?'#F87171':d.rsi<30?'#34D399':'#CBD5E1';
+      const vwapCol = d.vwap_dev>0.5?'#F87171':d.vwap_dev<-0.5?'#34D399':'#CBD5E1';
+      const bbBadge = d.bb_pos==='above'
+        ? el('span',{style:'background:rgba(239,68,68,.15);color:#F87171;font-size:10px;padding:2px 6px;border-radius:4px'},'▲ above')
+        : d.bb_pos==='below'
+        ? el('span',{style:'background:rgba(16,185,129,.15);color:#34D399;font-size:10px;padding:2px 6px;border-radius:4px'},'▼ below')
+        : el('span',{style:'background:rgba(100,116,139,.15);color:#94A3B8;font-size:10px;padding:2px 6px;border-radius:4px'},'inside');
+      const emaBadge = el('span',{
+        style:`font-size:10px;padding:2px 6px;border-radius:4px;${d.ema_trend==='bull'?'background:rgba(16,185,129,.15);color:#34D399':'background:rgba(239,68,68,.15);color:#F87171'}`
+      }, d.ema_trend);
+      tb.appendChild(el('tr',{},
+        el('td',{class:'left',style:'font-weight:600;color:#F8FAFC'},pair.split('/')[0]),
+        el('td',{},fmt(d.close,4)),
+        el('td',{style:`color:${rsiCol};font-weight:600`},fmt(d.rsi,1)),
+        el('td',{},fmt(d.atr_pct,2)+'%'),
+        el('td',{style:`color:${vwapCol}`},(d.vwap_dev>=0?'+':'')+fmt(d.vwap_dev,2)+'%'),
+        el('td',{style:d.vol_ratio>=1.2?'color:#FCD34D;font-weight:600':''},fmt(d.vol_ratio,2)+'x'),
+        el('td',{},bbBadge),
+        el('td',{},emaBadge),
+      ));
+    }
+    tbl.appendChild(tb);
+    ic.appendChild(el('div',{class:'overflow-x'},tbl));
+  }
+  wrap.appendChild(ic);
+
+  // ── Bottom row: recent trades + hermes ────────────────────────────────────
+  const row2 = el('div',{class:'two-col'});
 
   // Recent closed
   const rc = el('div',{class:'card'});
@@ -726,7 +794,7 @@ function buildOverview() {
     row.appendChild(el('span',{class:cc(p),style:'font-size:13px;font-weight:600'},fmtU(p)));
     rc.appendChild(row);
   }
-  wrap.appendChild(rc);
+  row2.appendChild(rc);
 
   // Hermes latest insight
   const hc = el('div',{class:'card'});
@@ -756,7 +824,8 @@ function buildOverview() {
         : el('div',{style:'margin-top:8px;font-size:11px;color:#64748B'},'No changes needed')
     ));
   }
-  wrap.appendChild(hc);
+  row2.appendChild(hc);
+  wrap.appendChild(row2);
   return wrap;
 }
 
@@ -1048,6 +1117,56 @@ function buildAdmin() {
     setTimeout(()=>{ state.adminAlert=null; render(); }, 4000);
   }
 
+  // ── Position & Risk (top, full width) ────────────────────────────────────
+  const riskCard = el('div',{class:'card'});
+  riskCard.appendChild(el('div',{class:'card-title'},'💰 Position & Risk Settings'));
+  riskCard.appendChild(el('p',{style:'font-size:12px;color:#64748B;margin-bottom:14px'},
+    'Core trading parameters. Changes apply immediately on the next bot loop.'));
+
+  const riskFields = [
+    {key:'stake_usdt',     label:'Stake per trade (USDT)',  hint:'Amount risked per position'},
+    {key:'leverage',       label:'Leverage',                hint:'Multiplier (e.g. 5 = 5×)'},
+    {key:'max_open_trades',label:'Max open trades',         hint:'How many positions at once'},
+    {key:'stoploss_pct',   label:'Stop loss %',             hint:'e.g. 2.5 = 2.5% from entry'},
+    {key:'daily_loss_limit',label:'Daily loss limit %',     hint:'Halt if wallet drops this much'},
+    {key:'max_consec_losses',label:'Max consecutive losses',hint:'Circuit breaker before cooldown'},
+  ];
+
+  const riskGrid = el('div',{style:'display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;margin-bottom:14px'});
+  for (const {key, label, hint} of riskFields) {
+    const curVal = state.adminParamEdits[key] !== undefined
+      ? state.adminParamEdits[key]
+      : (state.params[key] || '');
+    const row = el('div',{class:'param-edit-row'});
+    row.appendChild(el('label',{class:'param-edit-label',title:hint}, label));
+    const inp = el('input',{class:'param-edit-input', value: curVal,
+      style:'font-size:15px;font-weight:600;padding:8px 12px'});
+    inp.addEventListener('input', e => { state.adminParamEdits[key] = e.target.value; });
+    row.appendChild(inp);
+    row.appendChild(el('div',{style:'font-size:10px;color:#475569;margin-top:2px'}, hint));
+    riskGrid.appendChild(row);
+  }
+  riskCard.appendChild(riskGrid);
+
+  const saveRiskBtn = el('button',{class:'btn-primary',style:'width:auto;padding:9px 24px'},
+    '💾 Save Risk Settings');
+  saveRiskBtn.addEventListener('click', async () => {
+    const edits = {};
+    for (const {key} of riskFields) {
+      if (state.adminParamEdits[key] !== undefined) edits[key] = state.adminParamEdits[key];
+    }
+    if (!Object.keys(edits).length) { state.adminAlert={type:'err',msg:'No changes to save'}; render(); return; }
+    const res = await adminFetch('/api/admin/params',{method:'POST',body:JSON.stringify({updates:edits})});
+    if (res.ok) {
+      state.adminAlert={type:'ok',msg:`✅ Saved: ${res.updated.join(', ')}`};
+      for (const k of res.updated) delete state.adminParamEdits[k];
+      await fetchAll();
+    } else { state.adminAlert={type:'err',msg:'❌ '+res.error}; }
+    render();
+  });
+  riskCard.appendChild(saveRiskBtn);
+  wrap.appendChild(riskCard);
+
   const grid = el('div',{style:'display:grid;grid-template-columns:1fr 1fr;gap:1.25rem'});
 
   // ── Bot Control ────────────────────────────────────────────────────────────
@@ -1285,7 +1404,7 @@ function db_active_pairs_fallback() {
 // Auto-refresh admin state when on admin tab
 async function fetchAll() {
   try {
-    const [sum, open, closed, sigs, params, hermes, charts] = await Promise.all([
+    const [sum, open, closed, sigs, params, hermes, charts, indicators] = await Promise.all([
       fetch('/api/summary').then(r=>r.json()).catch(()=>({})),
       fetch('/api/open_trades').then(r=>r.json()).catch(()=>[]),
       fetch('/api/recent_trades').then(r=>r.json()).catch(()=>[]),
@@ -1293,10 +1412,11 @@ async function fetchAll() {
       fetch('/api/params').then(r=>r.json()).catch(()=>({})),
       fetch('/api/hermes').then(r=>r.json()).catch(()=>[]),
       fetch('/api/charts').then(r=>r.json()).catch(()=>({})),
+      fetch('/api/indicators').then(r=>r.json()).catch(()=>({})),
     ]);
     state.summary=sum; state.openTrades=open; state.recentTrades=closed;
     state.signals=sigs; state.params=params; state.hermes=hermes;
-    state.charts=charts;
+    state.charts=charts; state.indicators=indicators;
     state.lastUpdated=new Date();
     if (state.activeTab==='admin') await refreshAdminState();
   } catch(e) { console.error(e); }

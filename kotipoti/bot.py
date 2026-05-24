@@ -264,23 +264,29 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
 
     # ── ATR gate (applies to all signals) ────────────────────────────────────
     if atr_pct < atr_min:
-        return []   # market too quiet — scalps won't cover fees
+        log.debug(f"[Signal] {pair} ATR {atr_pct:.2f}% < min {atr_min} — too quiet")
+        return []
     if atr_pct > atr_max:
-        return []   # market too explosive — stoploss will get slipped
+        log.debug(f"[Signal] {pair} ATR {atr_pct:.2f}% > max {atr_max} — too wild")
+        return []
 
     # ── Volume gate ───────────────────────────────────────────────────────────
     vol_ok = vol_ratio >= vol_mult
 
+    # Log current indicator snapshot every candle (INFO so it's always visible)
+    log.info(f"[Indicators] {pair} | close={close:.4f} | rsi={rsi:.1f} | "
+             f"atr={atr_pct:.2f}% | vwap_dev={vwap_dev:+.2f}% | "
+             f"vol={vol_ratio:.2f}x | bb_pos={'above' if close>bb_upper else 'below' if close<bb_lower else 'inside'} | "
+             f"ema={'bear' if ema_f<ema_s else 'bull'}")
+
     # ── BB breakout SHORT ─────────────────────────────────────────────────────
+    # EMA cross removed — BB+RSI is already directional enough for scalping
     bb_short_ok  = close > bb_upper
     rsi_short_ok = rsi > rsi_short
-    ema_short_ok = ema_f < ema_s   # bearish EMA cross
 
-    if bb_short_ok and rsi_short_ok and ema_short_ok and vol_ok:
-        # 1h trend filter: block short if pair is strongly bullish (unless overextended)
+    if bb_short_ok and rsi_short_ok and vol_ok:
         overextended = rsi > 80
         trend_ok = not (pair_regime_label == "bull" and not overextended)
-        # BTC filter (alts only)
         btc_ok = True
         if pair in ALT_PAIRS:
             btc_ok = not (btc_regime_label == "bull" and not overextended)
@@ -288,30 +294,30 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
         if trend_ok and btc_ok:
             bb_pct = (close - bb_upper) / bb_upper * 100
             ema_gap = (ema_f - ema_s) / close * 100
+            log.info(f"[Signal] ✅ bb_short {pair} rsi={rsi:.1f} bb_pct={bb_pct:.2f}% vol={vol_ratio:.2f}x")
             signals.append({
-                "direction": "short",
-                "entry_tag": "bb_short",
-                "price":     close,
-                "rsi":       rsi,
-                "bb_pct":    round(bb_pct, 3),
-                "ema_gap":   round(ema_gap, 4),
-                "atr_pct":   round(atr_pct, 3),
-                "vwap_dev":  round(vwap_dev, 3),
-                "vol_ratio": round(vol_ratio, 2),
-                "session":   session,
-                "skip_reason": None,
+                "direction": "short", "entry_tag": "bb_short",
+                "price": close, "rsi": rsi,
+                "bb_pct": round(bb_pct, 3), "ema_gap": round(ema_gap, 4),
+                "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
             })
         else:
             reason = "trend_filter" if not trend_ok else "btc_filter"
+            log.info(f"[Signal] ⛔ bb_short {pair} blocked: {reason}")
             db.log_signal(pair, "short", fired=False, skip_reason=reason,
                           price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+    elif bb_short_ok:
+        miss = []
+        if not rsi_short_ok: miss.append(f"rsi={rsi:.1f}<{rsi_short}")
+        if not vol_ok:        miss.append(f"vol={vol_ratio:.2f}x<{vol_mult}x")
+        log.info(f"[Signal] 〰 bb_short {pair} almost — missing: {', '.join(miss)}")
 
     # ── BB breakout LONG ──────────────────────────────────────────────────────
     bb_long_ok  = close < bb_lower
     rsi_long_ok = rsi < rsi_long
-    ema_long_ok = ema_f > ema_s   # bullish EMA cross
 
-    if bb_long_ok and rsi_long_ok and ema_long_ok and vol_ok:
+    if bb_long_ok and rsi_long_ok and vol_ok:
         overextended = rsi < 20
         trend_ok = not (pair_regime_label == "bear" and not overextended)
         btc_ok = True
@@ -321,61 +327,54 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
         if trend_ok and btc_ok:
             bb_pct = (bb_lower - close) / bb_lower * 100
             ema_gap = (ema_f - ema_s) / close * 100
+            log.info(f"[Signal] ✅ bb_long {pair} rsi={rsi:.1f} bb_pct={bb_pct:.2f}% vol={vol_ratio:.2f}x")
             signals.append({
-                "direction": "long",
-                "entry_tag": "bb_long",
-                "price":     close,
-                "rsi":       rsi,
-                "bb_pct":    round(bb_pct, 3),
-                "ema_gap":   round(ema_gap, 4),
-                "atr_pct":   round(atr_pct, 3),
-                "vwap_dev":  round(vwap_dev, 3),
-                "vol_ratio": round(vol_ratio, 2),
-                "session":   session,
-                "skip_reason": None,
+                "direction": "long", "entry_tag": "bb_long",
+                "price": close, "rsi": rsi,
+                "bb_pct": round(bb_pct, 3), "ema_gap": round(ema_gap, 4),
+                "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
             })
         else:
             reason = "trend_filter" if not trend_ok else "btc_filter"
+            log.info(f"[Signal] ⛔ bb_long {pair} blocked: {reason}")
             db.log_signal(pair, "long", fired=False, skip_reason=reason,
                           price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+    elif bb_long_ok:
+        miss = []
+        if not rsi_long_ok: miss.append(f"rsi={rsi:.1f}>{rsi_long}")
+        if not vol_ok:       miss.append(f"vol={vol_ratio:.2f}x<{vol_mult}x")
+        log.info(f"[Signal] 〰 bb_long {pair} almost — missing: {', '.join(miss)}")
 
     # ── VWAP reversion SHORT ──────────────────────────────────────────────────
-    # Price significantly above VWAP + volume spike → expect reversion
-    if vwap_dev > vwap_min and vol_ratio >= vol_mult * 1.3 and rsi > 60:
+    # vol_mult (not 1.3x) — VWAP signal doesn't need as extreme a volume spike
+    if vwap_dev > vwap_min and vol_ratio >= vol_mult and rsi > 60:
         trend_ok = pair_regime_label != "bull"
         btc_ok   = btc_regime_label != "bull" if pair in ALT_PAIRS else True
         if trend_ok and btc_ok:
+            log.info(f"[Signal] ✅ vwap_short {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}")
             signals.append({
-                "direction": "short",
-                "entry_tag": "vwap_short",
-                "price":     close,
-                "rsi":       rsi,
-                "bb_pct":    round((close - bb_upper) / bb_upper * 100 if bb_upper else 0, 3),
-                "ema_gap":   round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
-                "atr_pct":   round(atr_pct, 3),
-                "vwap_dev":  round(vwap_dev, 3),
-                "vol_ratio": round(vol_ratio, 2),
-                "session":   session,
-                "skip_reason": None,
+                "direction": "short", "entry_tag": "vwap_short",
+                "price": close, "rsi": rsi,
+                "bb_pct": round((close - bb_upper) / bb_upper * 100 if bb_upper else 0, 3),
+                "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
+                "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
             })
 
     # ── VWAP reversion LONG ───────────────────────────────────────────────────
-    if vwap_dev < -vwap_min and vol_ratio >= vol_mult * 1.3 and rsi < 40:
+    if vwap_dev < -vwap_min and vol_ratio >= vol_mult and rsi < 40:
         trend_ok = pair_regime_label != "bear"
         btc_ok   = btc_regime_label != "bear" if pair in ALT_PAIRS else True
         if trend_ok and btc_ok:
+            log.info(f"[Signal] ✅ vwap_long {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}")
             signals.append({
-                "direction": "long",
-                "entry_tag": "vwap_long",
-                "price":     close,
-                "rsi":       rsi,
-                "bb_pct":    round((bb_lower - close) / bb_lower * 100 if bb_lower else 0, 3),
-                "ema_gap":   round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
-                "atr_pct":   round(atr_pct, 3),
-                "vwap_dev":  round(vwap_dev, 3),
-                "vol_ratio": round(vol_ratio, 2),
-                "session":   session,
-                "skip_reason": None,
+                "direction": "long", "entry_tag": "vwap_long",
+                "price": close, "rsi": rsi,
+                "bb_pct": round((bb_lower - close) / bb_lower * 100 if bb_lower else 0, 3),
+                "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
+                "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
             })
 
     return signals
@@ -860,7 +859,25 @@ def run():
             wallet_now = wallet_start + total_profit
             check_daily_loss(wallet_start, wallet_now)
 
-            # ── 6. Status log every loop ──────────────────────────────────────
+            # ── 6. Store indicator snapshot for dashboard ─────────────────────
+            snapshot = {}
+            for pair, df in df5m.items():
+                row = df.iloc[-1]
+                snapshot[pair] = {
+                    "close":    round(float(row["close"]), 4),
+                    "rsi":      round(float(row.get("rsi", 0) or 0), 1),
+                    "atr_pct":  round(float(row.get("atr_pct", 0) or 0), 3),
+                    "vwap_dev": round(float(row.get("vwap_dev", 0) or 0), 2),
+                    "vol_ratio":round(float(row.get("volume_ratio", 0) or 0), 2),
+                    "bb_pos":   "above" if float(row["close"]) > float(row.get("bb_upper", 0) or 0)
+                                else "below" if float(row["close"]) < float(row.get("bb_lower", 999999) or 999999)
+                                else "inside",
+                    "ema_trend":"bear" if float(row.get("ema_fast", 0) or 0) < float(row.get("ema_slow", 0) or 0) else "bull",
+                }
+            db.set_bot_state("indicators", json.dumps(snapshot))
+            db.set_bot_state("btc_regime", btc_regime_label)
+
+            # ── 7. Status log every loop ──────────────────────────────────────
             open_trades = db.get_open_trades()
             log.info(f"[Loop] BTC={btc_regime_label} | open={len(open_trades)}/{max_open} "
                      f"| session={session_label()} | wallet≈{wallet_now:.0f} USDT")

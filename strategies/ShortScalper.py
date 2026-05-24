@@ -378,27 +378,39 @@ class ShortScalper(IStrategy):
             )
 
         # ---- BTC 1h for regime filter (alts only) ----
-        # We merge the raw BTC 1h frame and rely on merge_informative_pair's
-        # auto-suffix ("_1h") then rename after. This avoids double-prefix issues.
+        # Manual merge to avoid merge_informative_pair's suffix+ffill conflict.
+        # We rename BTC indicator columns to btc_* before merging so they don't
+        # collide with the pair's own _1h columns already in the dataframe.
         if pair != BTC_PAIR:
             btc_1h = self.dp.get_pair_dataframe(pair=BTC_PAIR, timeframe="1h")
             if not btc_1h.empty:
                 btc_1h = self._add_informative_indicators(btc_1h, "1h")
-                # Rename BTC close to a non-OHLCV name so merge_informative_pair keeps it
-                btc_1h["btc_close"] = btc_1h["close"]
-                dataframe = merge_informative_pair(
-                    dataframe, btc_1h, self.timeframe, "1h",
-                    ffill=True, suffix="btc_1h"
+                # Keep only the columns we need, renamed to btc_* to avoid collision
+                btc_cols = {
+                    "date":               "date",
+                    "close":              "btc_close",
+                    "ema21_1h":           "btc_ema21_1h",
+                    "rsi_1h":             "btc_rsi_1h",
+                    "higher_highs_1h":    "btc_higher_highs_1h",
+                    "lower_lows_1h":      "btc_lower_lows_1h",
+                    "bb_upper_2std_1h":   "btc_bb_upper_2std_1h",
+                    "bb_lower_2std_1h":   "btc_bb_lower_2std_1h",
+                }
+                btc_slim = btc_1h[[c for c in btc_cols if c in btc_1h.columns]].copy()
+                btc_slim = btc_slim.rename(columns={k: v for k, v in btc_cols.items() if k != "date"})
+                btc_slim = btc_slim.sort_values("date")
+                # Resample BTC 1h timestamps down to the 5m base dataframe via merge_asof
+                import pandas as pd
+                dataframe = dataframe.sort_values("date")
+                dataframe = pd.merge_asof(
+                    dataframe, btc_slim,
+                    on="date", direction="backward"
                 )
-                # Columns are now e.g. ema21_1h_btc_1h → rename to btc_ema21_1h
-                # Also btc_close_btc_1h → btc_close_1h
-                rename_map = {}
-                for col in list(dataframe.columns):
-                    if col.endswith("_btc_1h"):
-                        base = col[:-len("_btc_1h")]
-                        rename_map[col] = f"btc_{base}"
-                if rename_map:
-                    dataframe = dataframe.rename(columns=rename_map)
+                # Forward-fill any NaNs at the start
+                btc_result_cols = [v for k, v in btc_cols.items() if k != "date"]
+                for col in btc_result_cols:
+                    if col in dataframe.columns:
+                        dataframe[col] = dataframe[col].ffill()
 
         return dataframe
 

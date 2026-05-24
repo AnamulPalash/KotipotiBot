@@ -57,6 +57,33 @@ services:
     networks:
       - kotipoti_net
 
+  dashboard:
+    image: python:3.11-slim
+    container_name: kotipotibot_dashboard
+    restart: unless-stopped
+    volumes:
+      - ./dashboard_app.py:/app/dashboard_app.py:ro
+      - ./custom-dashboard.jsx:/app/custom-dashboard.jsx:ro
+      - ./dashboard_requirements.txt:/app/dashboard_requirements.txt:ro
+    working_dir: /app
+    ports:
+      - "5000:5000"   # Custom dashboard on host port 5000
+    env_file:
+      - .env
+    environment:
+      # Point at the freqtrade container on the internal network
+      FREQTRADE_API: "http://freqtrade:8080"
+      FREQTRADE_USERNAME: "kotipoti"
+      DASHBOARD_PORT: "5000"
+      # FREQTRADE_PASSWORD is read from .env
+    command: >
+      sh -c "pip install flask flask-cors requests --quiet &&
+             python dashboard_app.py"
+    depends_on:
+      - freqtrade
+    networks:
+      - kotipoti_net
+
 networks:
   kotipoti_net:
     driver: bridge

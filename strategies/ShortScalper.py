@@ -1,29 +1,32 @@
 # pragma pylint: disable=missing-docstring, invalid-name, pointless-string-statement
 # flake8: noqa: F401
 """
-ShortScalper v2 — KotipotiBot
-===============================
-Futures short-only scalping strategy on 5m timeframe with 5x leverage.
+ScalpBot v2 — KotipotiBot
+===========================
+Futures scalping strategy on 5m timeframe with 5x leverage.
+Trades both LONG and SHORT based on Bollinger Band overextension + RSI extremes.
 
 Pairs: BTC/USDT:USDT, ETH/USDT:USDT, SOL/USDT:USDT, DOGE/USDT:USDT, XRP/USDT:USDT
-Timeframe: 5m
-Direction: SHORT ONLY
+Timeframe: 5m (+ 1h, 4h informative)
+Direction: LONG and SHORT
 Exchange: Bybit (futures, dry-run)
 
+Entry signals:
+  SHORT: price above BB upper + RSI > 68 + EMA fast < slow + volume spike
+  LONG:  price below BB lower + RSI < 32 + EMA fast > slow + volume spike
+
 Filters:
-  - 1h trend filter (block short if pair's own 1h is strongly bullish)
-  - BTC regime filter (block alt shorts if BTC 1h is strongly bullish)
-  - Overextension override (allow despite BTC block if RSI 1h > 80 AND price > 2σ above BB upper on 1h)
+  - 1h trend filter: block short if strongly bullish; block long if strongly bearish
+  - BTC regime filter: block alt shorts if BTC 1h strongly bullish; block alt longs if strongly bearish
+  - Overextension override: allow counter-trend entry if RSI 1h > 80/< 20 AND price > 2σ BB
 
 Safety controls:
   - Max daily loss: halt entries if wallet drops 10% in one UTC day
   - Max consecutive losses: halt after 4 consecutive losses, resume after 2h cooldown
   - Per-pair cooldown: 3 candles (15m) after a losing trade
   - Max 6 trades per pair per day
-  - Stale data guard: halt if candle data is stale beyond 2 candles
   - API error guard: halt after 5 errors in one hour
   - DB write fail guard: halt new entries if DB write fails
-  - Telegram failure: suppress entries only, never close open positions
 
 Market regime logging for every trade and every skipped signal.
 """
@@ -187,7 +190,7 @@ def _log_regime(entry: dict):
         with open(REGIME_LOG_FILE, "a") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception as e:
-        logger.warning(f"[ShortScalper] Failed to write regime log: {e}")
+        logger.warning(f"[ScalpBot] Failed to write regime log: {e}")
 
 
 class ShortScalper(IStrategy):
@@ -221,7 +224,10 @@ class ShortScalper(IStrategy):
     trailing_only_offset_is_reached = True
 
     # ---- Startup ----
-    startup_candle_count = 100
+    # 50 × 5m = 4h10m of warmup (enough for EMA21, RSI14, BB20 on the base tf).
+    # Informative 1h/4h data is fetched historically by Freqtrade on startup,
+    # so those indicators are ready immediately regardless of this value.
+    startup_candle_count = 50
 
     # ---- Order types ----
     order_types = {
@@ -319,11 +325,19 @@ class ShortScalper(IStrategy):
         bb2 = qtpylib.bollinger_bands(qtpylib.typical_price(df), window=20, stds=2)
         df[f"bb_upper_2std_{suffix}"] = bb2["upper"]
 
-        # Higher highs: last 3 candles each close higher than previous
+        # Higher highs: last 2 candles each make a higher high than the one before
         df[f"higher_highs_{suffix}"] = (
             (df["high"] > df["high"].shift(1)) &
             (df["high"].shift(1) > df["high"].shift(2))
         )
+        # Lower lows: mirror of higher highs, used for bearish trend detection
+        df[f"lower_lows_{suffix}"] = (
+            (df["low"] < df["low"].shift(1)) &
+            (df["low"].shift(1) < df["low"].shift(2))
+        )
+        # 2-std lower band for oversold overextension check
+        bb2_lower = qtpylib.bollinger_bands(qtpylib.typical_price(df), window=20, stds=2)
+        df[f"bb_lower_2std_{suffix}"] = bb2_lower["lower"]
         return df
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -364,19 +378,27 @@ class ShortScalper(IStrategy):
             )
 
         # ---- BTC 1h for regime filter (alts only) ----
+        # We merge the raw BTC 1h frame and rely on merge_informative_pair's
+        # auto-suffix ("_1h") then rename after. This avoids double-prefix issues.
         if pair != BTC_PAIR:
             btc_1h = self.dp.get_pair_dataframe(pair=BTC_PAIR, timeframe="1h")
             if not btc_1h.empty:
                 btc_1h = self._add_informative_indicators(btc_1h, "1h")
-                btc_1h = btc_1h.rename(columns={
-                    col: f"btc_{col}" for col in btc_1h.columns
-                    if col not in ["date", "open", "high", "low", "close", "volume"]
-                })
-                btc_1h = btc_1h[["date"] + [c for c in btc_1h.columns if c.startswith("btc_")]]
+                # Rename BTC close to a non-OHLCV name so merge_informative_pair keeps it
+                btc_1h["btc_close"] = btc_1h["close"]
                 dataframe = merge_informative_pair(
                     dataframe, btc_1h, self.timeframe, "1h",
-                    ffill=True, suffix="btc"
+                    ffill=True, suffix="btc_1h"
                 )
+                # Columns are now e.g. ema21_1h_btc_1h → rename to btc_ema21_1h
+                # Also btc_close_btc_1h → btc_close_1h
+                rename_map = {}
+                for col in list(dataframe.columns):
+                    if col.endswith("_btc_1h"):
+                        base = col[:-len("_btc_1h")]
+                        rename_map[col] = f"btc_{base}"
+                if rename_map:
+                    dataframe = dataframe.rename(columns=rename_map)
 
         return dataframe
 
@@ -439,7 +461,7 @@ class ShortScalper(IStrategy):
                             entry_tag: Optional[str], side: str, **kwargs) -> bool:
         allowed, reason = self._safety_gate(pair, current_time)
         if not allowed:
-            logger.info(f"[ShortScalper] {pair} entry blocked by safety gate: {reason}")
+            logger.info(f"[ScalpBot] {pair} entry blocked by safety gate: {reason}")
             return False
 
         # Increment pair trade count
@@ -475,7 +497,7 @@ class ShortScalper(IStrategy):
                     halt_until = current_time + timedelta(hours=CONSECUTIVE_LOSS_COOLDOWN_H)
                     self._consecutive_loss_halt_until = halt_until
                     logger.warning(
-                        f"[ShortScalper] {MAX_CONSECUTIVE_LOSSES} consecutive losses. "
+                        f"[ScalpBot] {MAX_CONSECUTIVE_LOSSES} consecutive losses. "
                         f"Halting new entries until {halt_until.isoformat()}"
                     )
             else:
@@ -491,113 +513,163 @@ class ShortScalper(IStrategy):
         # Guard: only trade allowed pairs
         if pair not in PAIRS_ALLOWED:
             dataframe["enter_short"] = 0
+            dataframe["enter_long"] = 0
             return dataframe
 
-        conditions = []
-        filters_log = []
-
-        # ---- Base 5m conditions ----
-        cond_bb = dataframe["close"] > dataframe["bb_upperband"]
-        cond_rsi = dataframe["rsi"] > 68
-        cond_ema = dataframe["ema_fast"] < dataframe["ema_slow"]
-        cond_vol = dataframe["volume"] > dataframe["volume_mean"] * 1.2
-        cond_vol_nonzero = dataframe["volume"] > 0
-
-        conditions.extend([cond_bb, cond_rsi, cond_ema, cond_vol, cond_vol_nonzero])
-
-        # ---- 1h own-pair trend filter ----
-        # Strongly bullish: price above EMA21_1h AND RSI_1h > 60 AND higher_highs_1h
-        # Use merged columns (suffixed by merge_informative_pair)
+        # ---- Resolve informative column names (merge_informative_pair suffixes) ----
         ema21_col = "ema21_1h_1h" if "ema21_1h_1h" in dataframe.columns else "ema21_1h"
-        rsi_col = "rsi_1h_1h" if "rsi_1h_1h" in dataframe.columns else "rsi_1h"
-        hh_col = "higher_highs_1h_1h" if "higher_highs_1h_1h" in dataframe.columns else "higher_highs_1h"
+        rsi_col   = "rsi_1h_1h"   if "rsi_1h_1h"   in dataframe.columns else "rsi_1h"
+        hh_col    = "higher_highs_1h_1h" if "higher_highs_1h_1h" in dataframe.columns else "higher_highs_1h"
+        ll_col    = "lower_lows_1h_1h"   if "lower_lows_1h_1h"   in dataframe.columns else "lower_lows_1h"
         bb_upper_2std_col = "bb_upper_2std_1h_1h" if "bb_upper_2std_1h_1h" in dataframe.columns else "bb_upper_2std_1h"
+        bb_lower_2std_col = "bb_lower_2std_1h_1h" if "bb_lower_2std_1h_1h" in dataframe.columns else "bb_lower_2std_1h"
 
-        if ema21_col in dataframe.columns and rsi_col in dataframe.columns and hh_col in dataframe.columns:
+        have_1h = all(c in dataframe.columns for c in [ema21_col, rsi_col])
+
+        # ---- 1h trend state (computed once, used by both directions) ----
+        if have_1h:
             strongly_bullish_1h = (
                 (dataframe["close"] > dataframe[ema21_col]) &
                 (dataframe[rsi_col] > 60) &
-                (dataframe[hh_col] == True)
+                (dataframe[hh_col] == True if hh_col in dataframe.columns else True)
             )
-            overextended_1h = (
+            strongly_bearish_1h = (
+                (dataframe["close"] < dataframe[ema21_col]) &
+                (dataframe[rsi_col] < 40) &
+                (dataframe[ll_col] == True if ll_col in dataframe.columns else True)
+            )
+            overextended_short_1h = (  # allow short even in bull if extremely overextended
                 (dataframe[rsi_col] > 80) &
-                (dataframe["close"] > dataframe[bb_upper_2std_col])
-            ) if bb_upper_2std_col in dataframe.columns else dataframe["rsi"] > 100  # never true fallback
+                (dataframe["close"] > dataframe[bb_upper_2std_col] if bb_upper_2std_col in dataframe.columns else False)
+            )
+            overextended_long_1h = (   # allow long even in bear if extremely oversold
+                (dataframe[rsi_col] < 20) &
+                (dataframe["close"] < dataframe[bb_lower_2std_col] if bb_lower_2std_col in dataframe.columns else False)
+            )
+        else:
+            # Informative not ready yet — don't block
+            strongly_bullish_1h = dataframe["rsi"] > 100   # never true
+            strongly_bearish_1h = dataframe["rsi"] > 100
+            overextended_short_1h = dataframe["rsi"] > 100
+            overextended_long_1h  = dataframe["rsi"] > 100
 
-            # Block if strongly bullish UNLESS overextended
-            pair_trend_blocked = strongly_bullish_1h & ~overextended_1h
-            conditions.append(~pair_trend_blocked)
+        # ---- BTC regime columns (alts only) ----
+        # After the rename in populate_indicators these are named btc_ema21_1h, btc_rsi_1h etc.
+        btc_ema_col = "btc_ema21_1h" if "btc_ema21_1h" in dataframe.columns else None
+        btc_rsi_col = "btc_rsi_1h"   if "btc_rsi_1h"   in dataframe.columns else None
+        btc_hh_col  = "btc_higher_highs_1h" if "btc_higher_highs_1h" in dataframe.columns else None
+        btc_ll_col  = "btc_lower_lows_1h"   if "btc_lower_lows_1h"   in dataframe.columns else None
+        have_btc = pair in ALT_PAIRS and btc_ema_col and btc_rsi_col and \
+                   all(c in dataframe.columns for c in [btc_ema_col, btc_rsi_col])
 
-        # ---- BTC regime filter (alts only) ----
-        if pair in ALT_PAIRS:
-            btc_ema_col = "btc_ema21_1h_btc" if "btc_ema21_1h_btc" in dataframe.columns else None
-            btc_rsi_col = "btc_rsi_1h_btc" if "btc_rsi_1h_btc" in dataframe.columns else None
-            btc_hh_col = "btc_higher_highs_1h_btc" if "btc_higher_highs_1h_btc" in dataframe.columns else None
-            btc_bb_col = "btc_bb_upper_2std_1h_btc" if "btc_bb_upper_2std_1h_btc" in dataframe.columns else None
+        if have_btc:
+            # btc_close was renamed to btc_btc_close by the rename_map loop
+            btc_close_col = "btc_btc_close" if "btc_btc_close" in dataframe.columns else None
+            btc_close = dataframe[btc_close_col] if btc_close_col else dataframe["close"]
+            btc_strongly_bullish = (
+                (btc_close > dataframe[btc_ema_col]) &
+                (dataframe[btc_rsi_col] > 60) &
+                (dataframe[btc_hh_col] if btc_hh_col and btc_hh_col in dataframe.columns else True)
+            )
+            btc_strongly_bearish = (
+                (btc_close < dataframe[btc_ema_col]) &
+                (dataframe[btc_rsi_col] < 40) &
+                (dataframe[btc_ll_col] if btc_ll_col and btc_ll_col in dataframe.columns else True)
+            )
+        else:
+            btc_strongly_bullish = dataframe["rsi"] > 100
+            btc_strongly_bearish = dataframe["rsi"] > 100
 
-            if btc_ema_col and btc_rsi_col and btc_hh_col and \
-               all(c in dataframe.columns for c in [btc_ema_col, btc_rsi_col, btc_hh_col]):
-                btc_strongly_bullish = (
-                    (dataframe["close"] > dataframe[btc_ema_col]) &
-                    (dataframe[btc_rsi_col] > 60) &
-                    (dataframe[btc_hh_col] == True)
-                )
-                pair_overextended = (
-                    (dataframe[rsi_col] > 80) &
-                    (dataframe["close"] > dataframe[bb_upper_2std_col])
-                ) if bb_upper_2std_col in dataframe.columns else dataframe["rsi"] > 100
+        # ==================================================================
+        # SHORT signal
+        # ==================================================================
+        # Base 5m: price above BB upper + RSI overbought + bearish EMA cross + volume
+        cond_bb_short  = dataframe["close"] > dataframe["bb_upperband"]
+        cond_rsi_short = dataframe["rsi"] > 68
+        cond_ema_short = dataframe["ema_fast"] < dataframe["ema_slow"]
+        cond_vol       = dataframe["volume"] > dataframe["volume_mean"] * 1.2
+        cond_vol_nz    = dataframe["volume"] > 0
 
-                btc_blocked = btc_strongly_bullish & ~pair_overextended
-                conditions.append(~btc_blocked)
+        short_base = cond_bb_short & cond_rsi_short & cond_ema_short & cond_vol & cond_vol_nz
 
-        # ---- Combine all conditions ----
-        combined = conditions[0]
-        for c in conditions[1:]:
-            combined = combined & c
+        # 1h filter: block if strongly bullish UNLESS overextended
+        short_trend_ok = ~(strongly_bullish_1h & ~overextended_short_1h)
+        # BTC filter (alts): block if BTC strongly bullish UNLESS pair itself is overextended
+        short_btc_ok   = ~(btc_strongly_bullish & ~overextended_short_1h) if have_btc else ~(dataframe["rsi"] > 100)
 
-        dataframe.loc[combined, "enter_short"] = 1
-        dataframe.loc[combined, "enter_tag"] = "short_scalp"
+        short_signal = short_base & short_trend_ok & short_btc_ok
 
-        # ---- Log skipped signals ----
-        # Rows where base conditions pass but filters blocked
-        base_pass = cond_bb & cond_rsi & cond_ema & cond_vol & cond_vol_nonzero
-        skipped = base_pass & ~combined
-        if skipped.any():
-            self._log_skipped_signals(dataframe, metadata, skipped,
-                                      cond_bb, cond_rsi, cond_ema, cond_vol)
+        dataframe.loc[short_signal, "enter_short"] = 1
+        dataframe.loc[short_signal, "enter_tag"]   = "short_scalp"
+
+        # Log skipped short signals
+        short_skipped = short_base & ~short_signal
+        if short_skipped.any():
+            self._log_skipped_signals(dataframe, metadata, short_skipped,
+                                      cond_bb_short, cond_rsi_short, cond_ema_short,
+                                      cond_vol, direction="short")
+
+        # ==================================================================
+        # LONG signal — mirror of the short
+        # ==================================================================
+        # Base 5m: price below BB lower + RSI oversold + bullish EMA cross + volume
+        cond_bb_long  = dataframe["close"] < dataframe["bb_lowerband"]
+        cond_rsi_long = dataframe["rsi"] < 32
+        cond_ema_long = dataframe["ema_fast"] > dataframe["ema_slow"]
+
+        long_base = cond_bb_long & cond_rsi_long & cond_ema_long & cond_vol & cond_vol_nz
+
+        # 1h filter: block if strongly bearish UNLESS oversold enough
+        long_trend_ok = ~(strongly_bearish_1h & ~overextended_long_1h)
+        # BTC filter (alts): block if BTC strongly bearish UNLESS pair itself is oversold
+        long_btc_ok   = ~(btc_strongly_bearish & ~overextended_long_1h) if have_btc else ~(dataframe["rsi"] > 100)
+
+        long_signal = long_base & long_trend_ok & long_btc_ok
+
+        dataframe.loc[long_signal, "enter_long"] = 1
+        dataframe.loc[long_signal, "enter_tag"]  = "long_scalp"
+
+        # Log skipped long signals
+        long_skipped = long_base & ~long_signal
+        if long_skipped.any():
+            self._log_skipped_signals(dataframe, metadata, long_skipped,
+                                      cond_bb_long, cond_rsi_long, cond_ema_long,
+                                      cond_vol, direction="long")
 
         return dataframe
 
     def _log_skipped_signals(self, dataframe, metadata, skipped_mask,
-                             cond_bb, cond_rsi, cond_ema, cond_vol):
+                             cond_bb, cond_rsi, cond_ema, cond_vol, direction="short"):
         pair = metadata["pair"]
         skipped_rows = dataframe[skipped_mask]
         for idx, row in skipped_rows.iterrows():
             dt = row.get("date", datetime.utcnow())
             entry = {
                 "type": "skipped_signal",
+                "direction": direction,
                 "pair": pair,
                 "timestamp": str(dt),
                 "session": _session(dt if isinstance(dt, datetime) else datetime.utcnow()),
                 "filters": {
-                    "price_above_upper_bb": bool(cond_bb.loc[idx]) if idx in cond_bb.index else None,
-                    "rsi_gt_68": bool(cond_rsi.loc[idx]) if idx in cond_rsi.index else None,
-                    "ema_bearish": bool(cond_ema.loc[idx]) if idx in cond_ema.index else None,
-                    "volume_above_avg": bool(cond_vol.loc[idx]) if idx in cond_vol.index else None,
+                    "price_outside_bb":   bool(cond_bb.loc[idx])  if idx in cond_bb.index  else None,
+                    "rsi_extreme":        bool(cond_rsi.loc[idx]) if idx in cond_rsi.index else None,
+                    "ema_aligned":        bool(cond_ema.loc[idx]) if idx in cond_ema.index else None,
+                    "volume_above_avg":   bool(cond_vol.loc[idx]) if idx in cond_vol.index else None,
                 },
-                "volatility": _volatility_label(dataframe),
+                "volatility":      _volatility_label(dataframe),
                 "volume_condition": _volume_label(dataframe),
             }
             _log_regime(entry)
             logger.info(
-                f"[ShortScalper] {pair} short skipped at {dt}: "
-                f"BB={entry['filters']['price_above_upper_bb']}, "
-                f"RSI={entry['filters']['rsi_gt_68']}, "
-                f"EMA={entry['filters']['ema_bearish']}, "
+                f"[ScalpBot] {pair} {direction} skipped at {dt}: "
+                f"BB={entry['filters']['price_outside_bb']}, "
+                f"RSI={entry['filters']['rsi_extreme']}, "
+                f"EMA={entry['filters']['ema_aligned']}, "
                 f"Vol={entry['filters']['volume_above_avg']}"
             )
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        # ---- Exit SHORT: price pulls back to BB midline + RSI no longer overbought ----
         dataframe.loc[
             (
                 (dataframe["close"] < dataframe["bb_middleband"]) &
@@ -605,6 +677,16 @@ class ShortScalper(IStrategy):
                 (dataframe["volume"] > 0)
             ),
             "exit_short",
+        ] = 1
+
+        # ---- Exit LONG: price pulls back to BB midline + RSI no longer oversold ----
+        dataframe.loc[
+            (
+                (dataframe["close"] > dataframe["bb_middleband"]) &
+                (dataframe["rsi"] > 55) &
+                (dataframe["volume"] > 0)
+            ),
+            "exit_long",
         ] = 1
 
         return dataframe
@@ -673,4 +755,4 @@ class ShortScalper(IStrategy):
             }
             _log_regime(entry)
         except Exception as e:
-            logger.warning(f"[ShortScalper] Failed to log trade regime: {e}")
+            logger.warning(f"[ScalpBot] Failed to log trade regime: {e}")

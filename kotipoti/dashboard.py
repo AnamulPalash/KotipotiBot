@@ -554,7 +554,7 @@ function buildUI() {
     case 'admin':    content.appendChild(buildAdmin());    break;
   }
   wrap.appendChild(content);
-  wrap.appendChild(el('p',{class:'footer'},'KotipotiBot v2 · auto-refreshes every 30s · read-only'));
+  wrap.appendChild(el('p',{class:'footer'},'KotipotiBot v2.4 · auto-refreshes every 30s · build 2026-05-25'));
   return wrap;
 }
 

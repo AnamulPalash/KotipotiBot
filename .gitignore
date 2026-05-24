@@ -27,8 +27,14 @@ user_data/logs/
 tradesv3.sqlite
 tradesv3.dryrun.sqlite
 
-# ---- Export archives ----
-exports/
+# ---- Trade exports (generated daily, not versioned) ----
+user_data/exports/*.json
+user_data/exports/*.csv
+# ---- Hermes reports (generated, not versioned) ----
+hermes/reports/*.txt
+hermes/reports/*.json
+# ---- Backtest results ----
+user_data/backtest_results/
 
 # ---- Python ----
 __pycache__/

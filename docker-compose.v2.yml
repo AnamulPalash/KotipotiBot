@@ -17,6 +17,9 @@ services:
       CANDLES_15M: "${CANDLES_15M:-150}"
       CANDLES_1H: "${CANDLES_1H:-150}"
       CANDLES_4H: "${CANDLES_4H:-120}"
+      BOT_VARIANT: "${BOT_VARIANT:-codex_v1}"
+      TAKER_FEE_BPS: "${TAKER_FEE_BPS:-5.5}"
+      SLIPPAGE_BPS: "${SLIPPAGE_BPS:-2.0}"
       TELEGRAM_TOKEN:   "${TELEGRAM_TOKEN:-}"     # set in .env
       TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"   # set in .env
     command: python main.py

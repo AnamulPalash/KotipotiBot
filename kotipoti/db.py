@@ -48,6 +48,9 @@ def init_db():
             exit_reason     TEXT,                   -- 'stoploss','trailing','roi','signal','manual'
             profit_usdt     REAL,
             profit_pct      REAL,
+            gross_profit_usdt REAL,
+            estimated_fee_usdt REAL,
+            estimated_slippage_usdt REAL,
             entry_tag       TEXT,
             exit_tag        TEXT,
             session         TEXT,                   -- 'Asia','London','US'
@@ -62,6 +65,7 @@ def init_db():
             trough_price    REAL,                   -- lowest seen while open
             exchange_order_id TEXT,
             stop_order_id   TEXT,
+            bot_variant     TEXT,
             is_open         INTEGER NOT NULL DEFAULT 1,
             dry_run         INTEGER NOT NULL DEFAULT 1
         );
@@ -111,7 +115,8 @@ def init_db():
             future_return_12 REAL,
             future_return_24 REAL,
             max_favorable_excursion REAL,
-            max_adverse_excursion REAL
+            max_adverse_excursion REAL,
+            bot_variant TEXT
         );
 
         CREATE TABLE IF NOT EXISTS params (
@@ -161,12 +166,25 @@ def init_db():
         ("trough_price",       "REAL"),
         ("exchange_order_id",  "TEXT"),
         ("stop_order_id",      "TEXT"),
+        ("gross_profit_usdt",  "REAL"),
+        ("estimated_fee_usdt", "REAL"),
+        ("estimated_slippage_usdt", "REAL"),
+        ("bot_variant",        "TEXT"),
     ]
     with _conn() as conn:
         existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
         for col, coltype in new_columns:
             if col not in existing:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {coltype}")
+
+    decision_columns = [
+        ("bot_variant", "TEXT"),
+    ]
+    with _conn() as conn:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(decisions)").fetchall()}
+        for col, coltype in decision_columns:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} {coltype}")
 
     # Seed default params if not present
     defaults = {
@@ -194,6 +212,9 @@ def init_db():
         "pair_cooldown_min":  "15",
         "blocked_sessions":   "[]",    # JSON list e.g. '["Asia"]'
         "hermes_auto_apply":   "false", # require review before Hermes changes params
+        "bot_variant":         os.environ.get("BOT_VARIANT", "codex_v1"),
+        "taker_fee_bps":       os.environ.get("TAKER_FEE_BPS", "5.5"),
+        "slippage_bps":        os.environ.get("SLIPPAGE_BPS", "2.0"),
     }
     with _conn() as conn:
         now = _now()
@@ -257,6 +278,9 @@ PARAM_SCHEMA = {
     "pair_cooldown_min":  {"type": int,   "min": 0,  "max": 1440},
     "blocked_sessions":   {"type": "json_list", "allowed": {"Asia", "London", "US"}},
     "hermes_auto_apply":  {"type": "bool"},
+    "bot_variant":        {"type": "text", "max_len": 64},
+    "taker_fee_bps":      {"type": float, "min": 0.0, "max": 100.0},
+    "slippage_bps":       {"type": float, "min": 0.0, "max": 100.0},
 }
 
 
@@ -283,6 +307,13 @@ def validate_param_update(key: str, value) -> str:
         if sval not in {"true", "false"}:
             raise ValueError(f"{key} must be true or false")
         return sval
+    if typ == "text":
+        sval = str(value).strip()
+        if not sval:
+            raise ValueError(f"{key} cannot be empty")
+        if len(sval) > spec.get("max_len", 255):
+            raise ValueError(f"{key} is too long")
+        return sval
 
     try:
         parsed = typ(value)
@@ -303,7 +334,10 @@ def open_trade(pair, side, entry_price, amount, stake_usdt, leverage,
                entry_tag, session, btc_regime, atr_at_entry, dry_run=True,
                rsi_at_entry=None, vwap_dev_at_entry=None,
                vol_ratio_at_entry=None, bb_pct_at_entry=None,
-               pair_regime=None, exchange_order_id=None, stop_order_id=None) -> int:
+               pair_regime=None, exchange_order_id=None, stop_order_id=None,
+               bot_variant=None) -> int:
+    if bot_variant is None:
+        bot_variant = get_param("bot_variant", os.environ.get("BOT_VARIANT", "codex_v1"))
     with _conn() as conn:
         cur = conn.execute("""
             INSERT INTO trades
@@ -311,13 +345,13 @@ def open_trade(pair, side, entry_price, amount, stake_usdt, leverage,
                entry_time, entry_tag, session, btc_regime, atr_at_entry,
                rsi_at_entry, vwap_dev_at_entry, vol_ratio_at_entry,
                bb_pct_at_entry, pair_regime, peak_price, trough_price,
-               exchange_order_id, stop_order_id, is_open, dry_run)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)
+               exchange_order_id, stop_order_id, bot_variant, is_open, dry_run)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)
         """, (pair, side, entry_price, amount, stake_usdt, leverage,
               _now(), entry_tag, session, btc_regime, atr_at_entry,
               rsi_at_entry, vwap_dev_at_entry, vol_ratio_at_entry,
               bb_pct_at_entry, pair_regime, entry_price, entry_price,
-              exchange_order_id, stop_order_id, int(dry_run)))
+              exchange_order_id, stop_order_id, bot_variant, int(dry_run)))
         return cur.lastrowid
 
 def close_trade(trade_id: int, exit_price: float, exit_reason: str, exit_tag: str = ""):
@@ -338,15 +372,27 @@ def close_trade(trade_id: int, exit_price: float, exit_reason: str, exit_tag: st
             profit_pct  = (exit_price - entry_price) / entry_price * 100 * leverage
         else:
             profit_pct  = (entry_price - exit_price) / entry_price * 100 * leverage
-        profit_usdt = stake_usdt * profit_pct / 100
+        gross_profit_usdt = stake_usdt * profit_pct / 100
+        p = get_all_params()
+        taker_fee_bps = float(p.get("taker_fee_bps", "5.5"))
+        slippage_bps = float(p.get("slippage_bps", "2.0"))
+        entry_notional = abs(amount * entry_price)
+        exit_notional = abs(amount * exit_price)
+        round_trip_notional = entry_notional + exit_notional
+        estimated_fee_usdt = round_trip_notional * taker_fee_bps / 10000
+        estimated_slippage_usdt = round_trip_notional * slippage_bps / 10000
+        profit_usdt = gross_profit_usdt - estimated_fee_usdt - estimated_slippage_usdt
 
         conn.execute("""
             UPDATE trades SET
               exit_price=?, exit_time=?, exit_reason=?, exit_tag=?,
-              profit_usdt=?, profit_pct=?, is_open=0
+              profit_usdt=?, profit_pct=?, gross_profit_usdt=?,
+              estimated_fee_usdt=?, estimated_slippage_usdt=?, is_open=0
             WHERE id=?
         """, (exit_price, _now(), exit_reason, exit_tag,
-              round(profit_usdt, 4), round(profit_pct, 4), trade_id))
+              round(profit_usdt, 4), round(profit_pct, 4),
+              round(gross_profit_usdt, 4), round(estimated_fee_usdt, 4),
+              round(estimated_slippage_usdt, 4), trade_id))
 
 def get_open_trades() -> List[Dict]:
     with _conn() as conn:
@@ -419,15 +465,19 @@ def log_decision(pair: str, candle_ts: str = None, price=None, rsi=None,
                  bb_position=None, ema_trend=None, btc_1h_regime=None,
                  pair_15m_regime=None, pair_1h_regime=None, pair_4h_regime=None,
                  signal_type=None, fired: bool = False, skip_reason=None,
-                 params_snapshot: dict = None, context: dict = None):
+                 params_snapshot: dict = None, context: dict = None,
+                 bot_variant=None):
+    if bot_variant is None:
+        bot_variant = get_param("bot_variant", os.environ.get("BOT_VARIANT", "codex_v1"))
     with _conn() as conn:
         conn.execute("""
             INSERT INTO decisions
               (ts, candle_ts, pair, price, rsi, atr_pct, vwap_dev,
                volume_ratio, bb_position, ema_trend, btc_1h_regime,
                pair_15m_regime, pair_1h_regime, pair_4h_regime,
-               signal_type, fired, skip_reason, params_snapshot, context_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               signal_type, fired, skip_reason, params_snapshot, context_json,
+               bot_variant)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             _now(), candle_ts, pair, price, rsi, atr_pct, vwap_dev,
             volume_ratio, bb_position, ema_trend, btc_1h_regime,
@@ -435,6 +485,7 @@ def log_decision(pair: str, candle_ts: str = None, price=None, rsi=None,
             signal_type, int(fired), skip_reason,
             json.dumps(params_snapshot) if params_snapshot else None,
             json.dumps(context) if context else None,
+            bot_variant,
         ))
 
 

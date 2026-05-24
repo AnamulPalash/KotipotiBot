@@ -54,6 +54,7 @@ log = logging.getLogger("kotipoti")
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() != "false"
 API_KEY   = os.environ.get("BYBIT_API_KEY", "")
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
+BOT_VARIANT = os.environ.get("BOT_VARIANT", "codex_v1")
 
 PAIRS = db.DEFAULT_PAIRS
 ALT_PAIRS = {"ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"}
@@ -1110,6 +1111,7 @@ def run():
                                 pair_regime=p_regime,
                                 exchange_order_id=order.get("id"),
                                 stop_order_id=stop_id,
+                                bot_variant=BOT_VARIANT,
                             )
                             tg.trade_opened(pair, direction, price, stake,
                                             leverage, entry_tag, DRY_RUN)

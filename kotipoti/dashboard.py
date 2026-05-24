@@ -1329,6 +1329,7 @@ function buildAdmin() {
     'Bollinger / EMA':   ['bb_period','bb_std','ema_fast','ema_slow'],
     'ATR Filter':        ['atr_period','atr_min_pct','atr_max_pct'],
     'Risk / Position':   ['stoploss_pct','trailing_pct','trailing_offset','leverage','max_open_trades','stake_usdt'],
+    'Comparison / Costs': ['bot_variant','taker_fee_bps','slippage_bps'],
     'Circuit Breakers':  ['daily_loss_limit','max_consec_losses','pair_cooldown_min','blocked_sessions','hermes_auto_apply'],
   };
 

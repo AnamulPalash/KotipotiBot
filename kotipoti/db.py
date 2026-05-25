@@ -210,21 +210,28 @@ def init_db():
         "atr_min_pct":        "0.1",   # block if ATR% < this (too quiet)
         "atr_max_pct":        "6.0",   # block if ATR% > this (too wild)
         "vwap_dev_min":       "0.15",  # min % deviation for VWAP signal
-        "stoploss_pct":       "2.5",
-        "trailing_pct":       "1.0",
-        "trailing_offset":    "1.5",
-        "leverage":           "5",
-        "max_open_trades":    "3",
-        "stake_usdt":         os.environ.get("STAKE_USDT", "500"),
-        "daily_loss_limit":   "10.0",  # % of wallet
-        "max_consec_losses":  "4",
-        "pair_cooldown_min":  "15",
-        "blocked_sessions":   "[]",    # JSON list e.g. '["Asia"]'
-        "hermes_auto_apply":   "false", # require review before Hermes changes params
-        "bot_variant":         os.environ.get("BOT_VARIANT", "codex_v2_active"),
-        "taker_fee_bps":       os.environ.get("TAKER_FEE_BPS", "5.5"),
-        "slippage_bps":        os.environ.get("SLIPPAGE_BPS", "2.0"),
-        "wallet_start":        os.environ.get("DRY_RUN_WALLET", "5000"),
+        "stoploss_pct":            "1.2",
+        "trailing_pct":            "1.0",
+        "trailing_offset":         "1.5",
+        "leverage":                "5",
+        "max_open_trades":         "3",
+        "stake_usdt":              os.environ.get("STAKE_USDT", "500"),
+        "daily_loss_limit":        "10.0",  # % of wallet
+        "max_consec_losses":       "4",
+        "pair_cooldown_min":       "15",
+        "max_hold_hours":          "6.0",   # force-close after N hours
+        "blocked_sessions":        "[]",    # JSON list e.g. '["Asia"]'
+        "hermes_auto_apply":       "false", # require review before Hermes changes params
+        "bot_variant":             os.environ.get("BOT_VARIANT", "codex_v2_active"),
+        "taker_fee_bps":           os.environ.get("TAKER_FEE_BPS", "5.5"),
+        "slippage_bps":            os.environ.get("SLIPPAGE_BPS", "2.0"),
+        "wallet_start":            os.environ.get("DRY_RUN_WALLET", "5000"),
+        # ATR-based dynamic stop
+        "atr_stop_multiplier":     "1.5",   # stop = entry ± ATR * multiplier
+        # Fixed-risk position sizing
+        "risk_per_trade_usdt":     "50",    # max USDT to risk per trade at stop
+        # Funding rate filter
+        "funding_rate_threshold":  "0.0005", # 0.05% — skip crowded longs/shorts
     }
     with _conn() as conn:
         now = _now()

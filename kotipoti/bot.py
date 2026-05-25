@@ -160,6 +160,24 @@ def fetch_ohlcv(exchange: ccxt.bybit, pair: str, timeframe: str,
         return None
 
 
+# ── Funding rate fetch ────────────────────────────────────────────────────────
+
+def fetch_funding_rate(exchange: ccxt.bybit, pair: str) -> Optional[float]:
+    """
+    Fetch the current funding rate for a perpetual futures pair.
+    Returns the rate as a float (e.g. 0.0001 = 0.01%) or None on failure.
+    Positive = longs pay shorts (crowded long).
+    Negative = shorts pay longs (crowded short).
+    """
+    try:
+        info = exchange.fetch_funding_rate(pair)
+        rate = info.get("fundingRate") or info.get("funding_rate")
+        return float(rate) if rate is not None else None
+    except Exception as e:
+        log.debug(f"fetch_funding_rate {pair}: {e}")
+        return None
+
+
 # ── Indicator computation ─────────────────────────────────────────────────────
 
 def compute_indicators(df: pd.DataFrame, p: Optional[Dict[str, str]] = None) -> pd.DataFrame:
@@ -296,6 +314,25 @@ def candle_quality(df: pd.DataFrame, side: str, lookback: int = 5) -> Dict:
     vol_prev = float(prev1.get("volume", 0) or 0)
     vol_expanding = vol_cur >= vol_prev * 0.85   # allow 15% slack — not strict equality
 
+    # ── Consecutive same-direction candles (extended move filter) ────────────
+    # If the last 3 candles all closed in the direction of our trade,
+    # the move is already extended — we're entering late, not fresh.
+    # Short: 3 consecutive bearish closes (close < open) = already been selling
+    # Long:  3 consecutive bullish closes (close > open) = already been buying
+    try:
+        last3 = df.iloc[-4:-1]   # 3 candles before the signal candle
+        if side == "short":
+            # 3 consecutive green candles into our short = extended upside, good for short entry
+            # BUT if last 3 are all red (selling already done) = move is exhausted
+            consec_against = all(float(r["close"]) < float(r["open"]) for _, r in last3.iterrows())
+        else:
+            # 3 consecutive red candles into our long = move already extended down, good for long
+            # BUT if last 3 are all green (buying already done) = extended, skip
+            consec_against = all(float(r["close"]) > float(r["open"]) for _, r in last3.iterrows())
+        not_extended = not consec_against
+    except Exception:
+        not_extended = True
+
     # ── RSI divergence (bonus) ────────────────────────────────────────────────
     divergence = False
     try:
@@ -321,6 +358,8 @@ def candle_quality(df: pd.DataFrame, side: str, lookback: int = 5) -> Dict:
         skip_reason = "weak_candle_body"
     elif not vol_expanding:
         skip_reason = "volume_not_expanding"
+    elif not not_extended:
+        skip_reason = "move_already_extended"
 
     quality_ok = skip_reason is None
 
@@ -329,6 +368,7 @@ def candle_quality(df: pd.DataFrame, side: str, lookback: int = 5) -> Dict:
         "rsi_not_stale":    rsi_not_stale,
         "body_strong":      body_strong,
         "vol_expanding":    vol_expanding,
+        "not_extended":     not_extended,
         "divergence":       divergence,
         "quality_ok":       quality_ok,
         "skip_reason":      skip_reason,
@@ -963,6 +1003,42 @@ def _stop_price(side: str, entry_price: float, stoploss_pct: float) -> float:
     return entry_price * (1 + stoploss_pct / 100)
 
 
+def _atr_stop_price(side: str, entry_price: float, atr: float,
+                    atr_multiplier: float = 1.5) -> float:
+    """
+    Compute a dynamic ATR-based stop price.
+    Longs: stop = entry - (atr * multiplier)
+    Shorts: stop = entry + (atr * multiplier)
+    Falls back to a fixed 1.5% stop if ATR is zero/None.
+    """
+    if not atr or atr <= 0:
+        # fallback to 1.5% fixed
+        return _stop_price(side, entry_price, 1.5)
+    offset = atr * atr_multiplier
+    if side == "long":
+        return entry_price - offset
+    return entry_price + offset
+
+
+def _risk_based_stake(entry_price: float, stop_price: float,
+                      risk_usdt: float, leverage: int,
+                      max_stake: float) -> float:
+    """
+    Calculate stake so that hitting the stop costs exactly risk_usdt.
+    stake = risk_usdt / (|entry - stop| / entry)
+    Capped at max_stake to avoid oversizing.
+    """
+    if entry_price <= 0 or stop_price <= 0:
+        return max_stake
+    pct_risk = abs(entry_price - stop_price) / entry_price
+    if pct_risk <= 0:
+        return max_stake
+    # Without leverage: stake * pct_risk = risk_usdt
+    # With leverage: effective loss = stake * pct_risk * leverage
+    stake = risk_usdt / (pct_risk * leverage)
+    return min(stake, max_stake)
+
+
 def place_exchange_stop(exchange: ccxt.bybit, pair: str, side: str,
                         amount: float, entry_price: float) -> Optional[str]:
     """Place a reduce-only conditional stop order in live mode."""
@@ -1198,12 +1274,13 @@ def run():
                 btc_1h_df = compute_1h_indicators(btc_1h_df)
             btc_regime_label = btc_regime(btc_1h_df)
 
-            # ── 2. Fetch and cache candles for all active pairs ───────────────
+            # ── 2. Fetch and cache candles + funding rates ────────────────────
             df5m: Dict[str, pd.DataFrame] = {}
             df15m: Dict[str, pd.DataFrame] = {}
             df1h: Dict[str, pd.DataFrame] = {}
             df4h: Dict[str, pd.DataFrame] = {}
             current_prices: Dict[str, float] = {}
+            funding_rates: Dict[str, Optional[float]] = {}
             new_candle_pairs = set()
 
             for pair in fetch_pairs:
@@ -1226,6 +1303,10 @@ def run():
                 df_4h = fetch_ohlcv(exchange, pair, "4h", limit=CANDLES_4H)
                 if df_4h is not None and len(df_4h) >= 30:
                     df4h[pair] = compute_1h_indicators(df_4h)
+
+                # Fetch funding rate (only for non-BTC pairs to save API calls)
+                if pair != BTC_PAIR:
+                    funding_rates[pair] = fetch_funding_rate(exchange, pair)
 
                 # Check if this is a new candle
                 last_ts = str(df.iloc[-1]["date"])
@@ -1337,13 +1418,55 @@ def run():
                         price      = sig["price"]
                         session    = sig["session"]
 
+                        # ── Funding rate filter ───────────────────────────────
+                        funding_rate = funding_rates.get(pair)
+                        funding_threshold = float(p.get("funding_rate_threshold", "0.0005"))
+                        if funding_rate is not None:
+                            if direction == "long" and funding_rate > funding_threshold:
+                                log.info(f"[Signal] ⛔ {entry_tag} {pair} LONG skipped: "
+                                         f"funding={funding_rate:.4%} > {funding_threshold:.4%} "
+                                         f"(crowded long)")
+                                db.log_signal(pair, direction, fired=False,
+                                              skip_reason="funding_rate_crowded_long",
+                                              price=price, rsi=sig["rsi"],
+                                              btc_regime=btc_regime_label, session=session)
+                                continue
+                            if direction == "short" and funding_rate < -funding_threshold:
+                                log.info(f"[Signal] ⛔ {entry_tag} {pair} SHORT skipped: "
+                                         f"funding={funding_rate:.4%} < -{funding_threshold:.4%} "
+                                         f"(crowded short)")
+                                db.log_signal(pair, direction, fired=False,
+                                              skip_reason="funding_rate_crowded_short",
+                                              price=price, rsi=sig["rsi"],
+                                              btc_regime=btc_regime_label, session=session)
+                                continue
+
+                        # ── ATR-based dynamic stop price ──────────────────────
+                        atr_val = float(df.iloc[-1].get("atr") or 0)
+                        atr_multiplier = float(p.get("atr_stop_multiplier", "1.5"))
+                        stop_px = _atr_stop_price(direction, price, atr_val, atr_multiplier)
+                        stop_pct = abs(price - stop_px) / price * 100
+
+                        # ── Risk-based position sizing ────────────────────────
+                        risk_usdt = float(p.get("risk_per_trade_usdt", "50"))
+                        actual_stake = _risk_based_stake(price, stop_px, risk_usdt,
+                                                         leverage, stake)
+
                         log.info(f"🔔 SIGNAL {direction.upper()} {pair} "
                                  f"| tag={entry_tag} | price={price:.4f} "
                                  f"| rsi={sig['rsi']:.1f} | atr={sig['atr_pct']:.2f}% "
+                                 f"| stop={stop_px:.4f} ({stop_pct:.2f}%) "
+                                 f"| stake={actual_stake:.1f} USDT (risk={risk_usdt} USDT) "
+                                 f"| funding={funding_rate:.4%}" if funding_rate is not None
+                                 else f"🔔 SIGNAL {direction.upper()} {pair} "
+                                 f"| tag={entry_tag} | price={price:.4f} "
+                                 f"| rsi={sig['rsi']:.1f} | atr={sig['atr_pct']:.2f}% "
+                                 f"| stop={stop_px:.4f} ({stop_pct:.2f}%) "
+                                 f"| stake={actual_stake:.1f} USDT (risk={risk_usdt} USDT) "
                                  f"| regime=BTC:{btc_regime_label} pair:{p_regime}")
 
                         order = place_order(exchange, pair, direction,
-                                            stake, leverage, price)
+                                            actual_stake, leverage, price)
                         if order:
                             stop_id = place_exchange_stop(
                                 exchange, pair, direction,
@@ -1365,7 +1488,7 @@ def run():
                                 side=direction,
                                 entry_price=price,
                                 amount=order.get("amount", 0),
-                                stake_usdt=stake,
+                                stake_usdt=actual_stake,
                                 leverage=leverage,
                                 entry_tag=entry_tag,
                                 session=session,
@@ -1381,7 +1504,7 @@ def run():
                                 stop_order_id=stop_id,
                                 bot_variant=BOT_VARIANT,
                             )
-                            tg.trade_opened(pair, direction, price, stake,
+                            tg.trade_opened(pair, direction, price, actual_stake,
                                             leverage, entry_tag, DRY_RUN)
                             db.log_signal(
                                 pair=pair, direction=direction, fired=True,

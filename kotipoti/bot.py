@@ -227,6 +227,27 @@ def compute_indicators(df: pd.DataFrame, p: Optional[Dict[str, str]] = None) -> 
     df["vwap"] = tp_vol.rolling(20).sum() / df["volume"].rolling(20).sum()
     df["vwap_dev"] = (df["close"] - df["vwap"]) / df["vwap"] * 100
 
+    # EWO (Elliott Wave Oscillator) = (EMA5 - EMA35) / close * 100
+    # Positive = short-term momentum above medium-term (trending up)
+    # Negative = short-term momentum below medium-term (trending down)
+    ema5  = df["close"].ewm(span=5,  adjust=False).mean()
+    ema35 = df["close"].ewm(span=35, adjust=False).mean()
+    df["ewo"] = (ema5 - ema35) / df["close"] * 100
+
+    # CTI (Composite Trend Indicator) = pearson correlation of close vs linear range
+    # +1.0 = perfect uptrend, -1.0 = perfect downtrend, ~0 = sideways
+    cti_period = int(p.get("cti_period", "20"))
+    def _pearson_corr(s: pd.Series) -> float:
+        n = len(s)
+        if n < 3:
+            return 0.0
+        x = np.arange(n, dtype=float)
+        xm = x - x.mean()
+        sm = s.values - s.values.mean()
+        denom = np.sqrt((xm ** 2).sum() * (sm ** 2).sum())
+        return float(np.dot(xm, sm) / denom) if denom > 0 else 0.0
+    df["cti"] = df["close"].rolling(cti_period).apply(_pearson_corr, raw=False)
+
     return df
 
 
@@ -389,6 +410,72 @@ def compute_1h_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["lower_lows"]   = (df["low"] < df["low"].shift(1)) & \
                          (df["low"].shift(1) < df["low"].shift(2))
     return df
+
+
+def compute_btc_1h_context(btc_1h_df: Optional[pd.DataFrame],
+                            ema_period: int = 20) -> Dict:
+    """
+    BTC context filter (NFI-inspired).
+    Returns dict with:
+      btc_above_ema: bool — BTC close above EMA{ema_period} on 1h
+      btc_ok_for_longs: bool
+      btc_ok_for_shorts: bool
+    """
+    if btc_1h_df is None or len(btc_1h_df) < ema_period + 2:
+        return {"btc_above_ema": True, "btc_ok_for_longs": True, "btc_ok_for_shorts": True}
+    row = btc_1h_df.iloc[-1]
+    btc_ema = btc_1h_df["close"].ewm(span=ema_period, adjust=False).mean().iloc[-1]
+    btc_close = float(row["close"])
+    btc_above_ema = btc_close > btc_ema
+    return {
+        "btc_above_ema":    btc_above_ema,
+        "btc_ok_for_longs": btc_above_ema,       # don't long if BTC in downtrend
+        "btc_ok_for_shorts": not btc_above_ema,  # don't short if BTC in uptrend
+        "btc_close":        btc_close,
+        "btc_ema":          btc_ema,
+    }
+
+
+def safe_dip_pump_ok(df5m: pd.DataFrame, side: str,
+                     dip_threshold: float = 0.12,
+                     pump_threshold: float = 0.15) -> Tuple[bool, str]:
+    """
+    Safe dip/pump filter (NFI-inspired).
+    Looks back 72 candles (6h at 5m) for falling knife or vertical pump.
+
+    For LONG entries:
+      Skip if close has fallen >dip_threshold (12%) from the 6h high.
+      ("Falling knife" — catch a falling knife and you lose fingers.)
+
+    For SHORT entries:
+      Skip if close has risen >pump_threshold (15%) from the 6h low.
+      ("Chasing a vertical pump" — already extended.)
+
+    Returns (ok, reason_if_not_ok).
+    """
+    lookback = 72  # 72 × 5m = 6 hours
+    window = df5m.tail(lookback)
+    if len(window) < 10:
+        return True, ""
+
+    close = float(df5m.iloc[-1]["close"])
+
+    if side == "long":
+        high_6h = float(window["high"].max())
+        if high_6h <= 0:
+            return True, ""
+        drop_from_high = (high_6h - close) / high_6h
+        if drop_from_high > dip_threshold:
+            return False, f"safe_dip:{drop_from_high:.1%}_from_6h_high"
+    else:  # short
+        low_6h = float(window["low"].min())
+        if low_6h <= 0:
+            return True, ""
+        pump_from_low = (close - low_6h) / low_6h
+        if pump_from_low > pump_threshold:
+            return False, f"safe_pump:{pump_from_low:.1%}_from_6h_low"
+
+    return True, ""
 
 
 # ── Regime classification ─────────────────────────────────────────────────────
@@ -567,126 +654,6 @@ def diagnose_no_signal(pair: str, df5m: pd.DataFrame, p: Dict[str, str],
     return ",".join(unique_reasons[:5]), context
 
 
-def score_signal(signal: Dict, btc_regime_label: str, pair_regime_label: str,
-                 pair_15m_regime_label: str, pair_4h_regime_label: str,
-                 p: Dict[str, str]) -> Tuple[float, List[str]]:
-    """
-    Freqtrade-style confirmation layer: keep signal generation simple, then
-    require enough independent evidence before a trade can be opened.
-    """
-    score = 0.35
-    reasons = []
-    tag = signal.get("entry_tag", "")
-    direction = signal.get("direction", "")
-    rsi = float(signal.get("rsi", 50) or 50)
-    vol = float(signal.get("vol_ratio", 0) or 0)
-    atr = float(signal.get("atr_pct", 0) or 0)
-    vwap_dev = abs(float(signal.get("vwap_dev", 0) or 0))
-    bb_pct = abs(float(signal.get("bb_pct", 0) or 0))
-
-    if tag.startswith("bb_"):
-        score += 0.18
-        reasons.append("bb_extreme")
-        if bb_pct >= 0.15:
-            score += 0.07
-            reasons.append("bb_distance")
-    elif tag.startswith("vwap_"):
-        score += 0.12
-        reasons.append("vwap_reversion")
-        if vwap_dev >= float(p.get("vwap_dev_min", "0.35")) * 1.5:
-            score += 0.08
-            reasons.append("vwap_distance")
-    elif tag.startswith("trend_"):
-        score -= 0.08
-        reasons.append("trend_lower_quality")
-
-    short_rsi_threshold = (
-        float(p.get("vwap_rsi_short", "62")) if tag.startswith("vwap_")
-        else float(p.get("rsi_short_entry", "68"))
-    )
-    long_rsi_threshold = (
-        float(p.get("vwap_rsi_long", "38")) if tag.startswith("vwap_")
-        else float(p.get("rsi_long_entry", "32"))
-    )
-    if direction == "short" and rsi >= short_rsi_threshold:
-        score += 0.10
-        reasons.append("rsi_confirmed")
-    if direction == "long" and rsi <= long_rsi_threshold:
-        score += 0.10
-        reasons.append("rsi_confirmed")
-
-    if vol >= float(p.get("volume_multiplier", "1.2")) * 1.25:
-        score += 0.08
-        reasons.append("volume_expansion")
-    elif vol < float(p.get("volume_multiplier", "1.2")):
-        score -= 0.12
-        reasons.append("volume_weak")
-
-    atr_min = float(p.get("atr_min_pct", "0.1"))
-    atr_max = float(p.get("atr_max_pct", "6.0"))
-    if atr_min <= atr <= atr_max:
-        score += 0.05
-        reasons.append("atr_in_range")
-
-    aligned_regime = (
-        (direction == "long" and pair_regime_label == "bull") or
-        (direction == "short" and pair_regime_label == "bear")
-    )
-    hostile_regime = (
-        (direction == "long" and pair_regime_label == "bear") or
-        (direction == "short" and pair_regime_label == "bull")
-    )
-    if aligned_regime:
-        score += 0.08
-        reasons.append("pair_regime_aligned")
-    if hostile_regime:
-        score -= 0.15
-        reasons.append("pair_regime_hostile")
-
-    multi_tf_aligned = pair_15m_regime_label == pair_4h_regime_label and (
-        (direction == "long" and pair_15m_regime_label == "bull") or
-        (direction == "short" and pair_15m_regime_label == "bear")
-    )
-    if multi_tf_aligned:
-        score += 0.08
-        reasons.append("multi_tf_aligned")
-
-    btc_hostile = (
-        (direction == "long" and btc_regime_label == "bear") or
-        (direction == "short" and btc_regime_label == "bull")
-    )
-    if btc_hostile:
-        score -= 0.12
-        reasons.append("btc_regime_hostile")
-
-    if signal.get("confirmation_softened"):
-        score -= 0.10
-        reasons.append("soft_confirmation_penalty")
-
-    return max(0.0, min(1.0, round(score, 3))), reasons
-
-
-def setup_allowed(signal: Dict, p: Dict[str, str]) -> Tuple[bool, str, Dict]:
-    min_trades = int(p.get("min_setup_trades", "8"))
-    min_win_rate = float(p.get("min_setup_win_rate", "35.0"))
-    perf = db.get_setup_performance(signal.get("entry_tag", ""), limit=50)
-    if perf["trade_count"] >= min_trades and perf["win_rate"] is not None:
-        if perf["win_rate"] < min_win_rate and perf["total_profit_usdt"] <= 0:
-            return False, "setup_performance_guard", perf
-    return True, "ok", perf
-
-
-def risk_adjusted_stake(base_stake: float, wallet_now: float, p: Dict[str, str]) -> float:
-    stoploss_pct = float(p.get("stoploss_pct", "2.5")) / 100
-    leverage = max(1, int(p.get("leverage", "5")))
-    max_risk_pct = float(p.get("max_risk_per_trade_pct", "1.0")) / 100
-    if wallet_now <= 0 or stoploss_pct <= 0:
-        return base_stake
-    risk_budget = wallet_now * max_risk_pct
-    max_stake = risk_budget / (stoploss_pct * leverage)
-    return max(1.0, min(base_stake, max_stake))
-
-
 # ── Signal evaluation ─────────────────────────────────────────────────────────
 
 def evaluate_signals(pair: str, df5m: pd.DataFrame,
@@ -694,11 +661,13 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
                      pair_regime_label: str,
                      pair_15m_regime_label: str = "unknown",
                      pair_4h_regime_label: str = "unknown",
-                     p: Optional[Dict[str, str]] = None) -> List[Dict]:
+                     p: Optional[Dict[str, str]] = None,
+                     btc_context: Optional[Dict] = None) -> List[Dict]:
     """
     Returns list of signal dicts with keys:
       direction, entry_tag, price, confidence (0-1)
     Empty list if no signal.
+    btc_context: result of compute_btc_1h_context(), pre-computed once per loop.
     """
     p      = p or db.get_all_params()
     row    = df5m.iloc[-1]
@@ -721,16 +690,40 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     atr_pct       = row.get("atr_pct", 1.0)
     vwap_dev      = row.get("vwap_dev", 0)
 
-    rsi_short      = float(p.get("rsi_short_entry", "64"))
-    rsi_long       = float(p.get("rsi_long_entry",  "36"))
+    rsi_short      = float(p.get("rsi_short_entry", "58"))
+    rsi_long       = float(p.get("rsi_long_entry",  "42"))
     vol_mult       = float(p.get("volume_multiplier", "0.8"))
     atr_min        = float(p.get("atr_min_pct", "0.1"))
     atr_max        = float(p.get("atr_max_pct", "6.0"))
-    vwap_min       = float(p.get("vwap_dev_min", "0.25"))
+    vwap_min       = float(p.get("vwap_dev_min", "0.15"))
     vwap_rsi_short = float(p.get("vwap_rsi_short", "55"))
     vwap_rsi_long  = float(p.get("vwap_rsi_long", "45"))
     confirmation_mode = p.get("confirmation_mode", "soft")
     soft_confirm = confirmation_mode == "soft"
+
+    # EWO / CTI params
+    ewo_filter     = p.get("ewo_filter_enabled", "true").lower() == "true"
+    ewo_long_min   = float(p.get("ewo_long_min", "-2.0"))
+    ewo_short_max  = float(p.get("ewo_short_max", "2.0"))
+    cti_filter     = p.get("cti_filter_enabled", "true").lower() == "true"
+    cti_long_max   = float(p.get("cti_long_max", "-0.5"))
+    cti_short_min  = float(p.get("cti_short_min", "0.5"))
+
+    # Safe dip/pump params
+    safe_dip_enabled   = p.get("safe_dip_enabled", "true").lower() == "true"
+    safe_pump_enabled  = p.get("safe_pump_enabled", "true").lower() == "true"
+    safe_dip_thresh    = float(p.get("safe_dip_threshold", "0.12"))
+    safe_pump_thresh   = float(p.get("safe_pump_threshold", "0.15"))
+
+    # BTC context filter
+    btc_ctx_enabled = p.get("btc_context_enabled", "true").lower() == "true"
+    btc_ema_period  = int(p.get("btc_ema_period", "20"))
+    if btc_context is None:
+        btc_context = {"btc_ok_for_longs": True, "btc_ok_for_shorts": True}
+
+    # Current EWO and CTI from indicators
+    ewo_val = float(row.get("ewo", 0) or 0)
+    cti_val = float(row.get("cti", 0) or 0)
 
     if rsi is None or bb_upper is None:
         return []
@@ -863,22 +856,47 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
             db.log_signal(pair, "short", fired=False, skip_reason=cq_short["skip_reason"],
                           price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
         else:
-            raw_trend_ok = pair_regime_label != "bull" and pair_15m_regime_label != "bull"
-            trend_ok = raw_trend_ok or soft_confirm
-            btc_ok   = btc_regime_label != "bull" if pair in ALT_PAIRS else True
-            if trend_ok and btc_ok:
-                div_tag = " 📉divergence" if cq_short["divergence"] else ""
-                log.info(f"[Signal] ✅ vwap_short {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}{div_tag}")
-                signals.append({
-                    "direction": "short", "entry_tag": "vwap_short",
-                    "price": close, "rsi": rsi,
-                    "bb_pct": round((close - bb_upper) / bb_upper * 100 if bb_upper else 0, 3),
-                    "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
-                    "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
-                    "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
-                    "confirmation_softened": not raw_trend_ok and soft_confirm,
-                    "divergence": cq_short["divergence"],
-                })
+            # EWO filter: for vwap_short, EWO should be < ewo_short_max (not in strong uptrend)
+            ewo_ok = (not ewo_filter) or (ewo_val < ewo_short_max)
+            # CTI filter: skip if CTI > cti_short_min (price trending strongly up — bad time to short)
+            cti_ok = (not cti_filter) or (cti_val < cti_short_min)
+            # Safe pump filter: skip if price has pumped >15% in 6h (chasing top)
+            pump_ok, pump_reason = safe_dip_pump_ok(df5m, "short", safe_dip_thresh, safe_pump_thresh) \
+                if safe_pump_enabled else (True, "")
+
+            if not ewo_ok:
+                log.info(f"[Signal] ⛔ vwap_short {pair} EWO={ewo_val:.2f} > {ewo_short_max} (BTC upmomentum)")
+                db.log_signal(pair, "short", fired=False, skip_reason=f"ewo_too_high:{ewo_val:.2f}",
+                              price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+            elif not cti_ok:
+                log.info(f"[Signal] ⛔ vwap_short {pair} CTI={cti_val:.2f} > {cti_short_min} (strong uptrend)")
+                db.log_signal(pair, "short", fired=False, skip_reason=f"cti_uptrend:{cti_val:.2f}",
+                              price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+            elif not pump_ok:
+                log.info(f"[Signal] ⛔ vwap_short {pair} safe_pump: {pump_reason}")
+                db.log_signal(pair, "short", fired=False, skip_reason=pump_reason,
+                              price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+            else:
+                raw_trend_ok = pair_regime_label != "bull" and pair_15m_regime_label != "bull"
+                trend_ok = raw_trend_ok or soft_confirm
+                btc_dir_ok = (not btc_ctx_enabled) or btc_context.get("btc_ok_for_shorts", True)
+                btc_regime_ok = btc_regime_label != "bull" if pair in ALT_PAIRS else True
+                btc_ok = btc_dir_ok and btc_regime_ok
+                if trend_ok and btc_ok:
+                    div_tag = " 📉divergence" if cq_short["divergence"] else ""
+                    log.info(f"[Signal] ✅ vwap_short {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f} "
+                             f"ewo={ewo_val:.2f} cti={cti_val:.2f}{div_tag}")
+                    signals.append({
+                        "direction": "short", "entry_tag": "vwap_short",
+                        "price": close, "rsi": rsi,
+                        "bb_pct": round((close - bb_upper) / bb_upper * 100 if bb_upper else 0, 3),
+                        "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
+                        "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                        "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                        "confirmation_softened": not raw_trend_ok and soft_confirm,
+                        "divergence": cq_short["divergence"],
+                        "ewo": round(ewo_val, 3), "cti": round(cti_val, 3),
+                    })
 
     # ── VWAP reversion LONG ───────────────────────────────────────────────────
     if vwap_dev < -vwap_min and vol_ratio >= vol_mult and rsi < vwap_rsi_long:
@@ -887,22 +905,54 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
             db.log_signal(pair, "long", fired=False, skip_reason=cq_long["skip_reason"],
                           price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
         else:
-            raw_trend_ok = pair_regime_label != "bear" and pair_15m_regime_label != "bear"
-            trend_ok = raw_trend_ok or soft_confirm
-            btc_ok   = btc_regime_label != "bear" if pair in ALT_PAIRS else True
-            if trend_ok and btc_ok:
-                div_tag = " 📈divergence" if cq_long["divergence"] else ""
-                log.info(f"[Signal] ✅ vwap_long {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}{div_tag}")
-                signals.append({
-                    "direction": "long", "entry_tag": "vwap_long",
-                    "price": close, "rsi": rsi,
-                    "bb_pct": round((bb_lower - close) / bb_lower * 100 if bb_lower else 0, 3),
-                    "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
-                    "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
-                    "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
-                    "confirmation_softened": not raw_trend_ok and soft_confirm,
-                    "divergence": cq_long["divergence"],
-                })
+            # EWO filter: for vwap_long, EWO should be > ewo_long_min (not in deep downtrend)
+            ewo_ok = (not ewo_filter) or (ewo_val > ewo_long_min)
+            # CTI filter: skip if CTI < cti_long_max (strongly trending down — bad time to long)
+            cti_ok = (not cti_filter) or (cti_val > cti_long_max)
+            # Safe dip filter: skip if price fell >12% in 6h (falling knife)
+            dip_ok, dip_reason = safe_dip_pump_ok(df5m, "long", safe_dip_thresh, safe_pump_thresh) \
+                if safe_dip_enabled else (True, "")
+            # BTC context: don't long if BTC in 1h downtrend
+            btc_dir_ok = (not btc_ctx_enabled) or btc_context.get("btc_ok_for_longs", True)
+
+            if not ewo_ok:
+                log.info(f"[Signal] ⛔ vwap_long {pair} EWO={ewo_val:.2f} < {ewo_long_min} (deep downtrend)")
+                db.log_signal(pair, "long", fired=False, skip_reason=f"ewo_too_low:{ewo_val:.2f}",
+                              price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+            elif not cti_ok:
+                log.info(f"[Signal] ⛔ vwap_long {pair} CTI={cti_val:.2f} < {cti_long_max} (strong downtrend)")
+                db.log_signal(pair, "long", fired=False, skip_reason=f"cti_downtrend:{cti_val:.2f}",
+                              price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+            elif not dip_ok:
+                log.info(f"[Signal] ⛔ vwap_long {pair} safe_dip: {dip_reason}")
+                db.log_signal(pair, "long", fired=False, skip_reason=dip_reason,
+                              price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+            elif not btc_dir_ok:
+                btc_ema = btc_context.get("btc_ema", 0)
+                log.info(f"[Signal] ⛔ vwap_long {pair} BTC below 1h EMA{btc_ema_period} "
+                         f"({btc_context.get('btc_close', 0):.0f} < {btc_ema:.0f})")
+                db.log_signal(pair, "long", fired=False, skip_reason="btc_1h_downtrend",
+                              price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+            else:
+                raw_trend_ok = pair_regime_label != "bear" and pair_15m_regime_label != "bear"
+                trend_ok = raw_trend_ok or soft_confirm
+                btc_regime_ok = btc_regime_label != "bear" if pair in ALT_PAIRS else True
+                btc_ok = btc_dir_ok and btc_regime_ok
+                if trend_ok and btc_ok:
+                    div_tag = " 📈divergence" if cq_long["divergence"] else ""
+                    log.info(f"[Signal] ✅ vwap_long {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f} "
+                             f"ewo={ewo_val:.2f} cti={cti_val:.2f}{div_tag}")
+                    signals.append({
+                        "direction": "long", "entry_tag": "vwap_long",
+                        "price": close, "rsi": rsi,
+                        "bb_pct": round((bb_lower - close) / bb_lower * 100 if bb_lower else 0, 3),
+                        "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
+                        "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                        "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                        "confirmation_softened": not raw_trend_ok and soft_confirm,
+                        "divergence": cq_long["divergence"],
+                        "ewo": round(ewo_val, 3), "cti": round(cti_val, 3),
+                    })
 
     return signals
 
@@ -910,22 +960,27 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
 # ── Exit evaluation ───────────────────────────────────────────────────────────
 
 def check_exits(open_trades: List[Dict], df5m: Dict[str, pd.DataFrame],
-                current_prices: Dict[str, float],
-                current_time: datetime) -> List[Tuple[int, float, str]]:
+                current_prices: Dict[str, float]) -> Tuple[List[Tuple[int, float, str]], List[Tuple[int, float, str, float]]]:
     """
-    Returns list of (trade_id, exit_price, reason) for trades to close.
+    Returns:
+      exits:   list of (trade_id, exit_price, reason)  — full close
+      derisk:  list of (trade_id, exit_price, reason, close_fraction) — partial close
     """
     p = db.get_all_params()
-    sl_pct       = float(p.get("stoploss_pct",    "1.2")) / 100
-    trail_pct    = float(p.get("trailing_pct",    "1.0")) / 100
-    trail_offset = float(p.get("trailing_offset", "1.5")) / 100
-    rsi_exit_short = float(p.get("rsi_exit_short", "45"))
-    rsi_exit_long  = float(p.get("rsi_exit_long",  "55"))
-    max_hold_hours = float(p.get("max_hold_hours", "6.0"))
-    max_trade_duration_min = int(p.get("max_trade_duration_min", "180"))
-    time_stop_min_profit = float(p.get("time_stop_min_profit_pct", "0.0")) / 100
+    sl_pct         = float(p.get("stoploss_pct",         "1.2")) / 100
+    rsi_exit_short = float(p.get("rsi_exit_short",        "45"))
+    rsi_exit_long  = float(p.get("rsi_exit_long",         "55"))
+    max_hold_hours = float(p.get("max_hold_hours",         "6.0"))
+    # Profit-based trailing
+    be_trigger     = float(p.get("breakeven_trigger_pct",  "2.0")) / 100  # move stop to BE at +2%
+    trail_trigger  = float(p.get("trail_trigger_pct",      "4.0")) / 100  # trail at +4%
+    trail_offset   = float(p.get("trail_offset_pct",       "1.0")) / 100  # trail = peak - 1%
+    # Partial derisk
+    derisk_enabled = p.get("derisk_enabled", "true").lower() == "true"
 
-    exits = []
+    exits  = []
+    derisk = []
+
     for trade in open_trades:
         pair        = trade["pair"]
         side        = trade["side"]
@@ -941,31 +996,82 @@ def check_exits(open_trades: List[Dict], df5m: Dict[str, pd.DataFrame],
         else:
             profit_pct = (entry_price - current) / entry_price
 
-        peak = max(float(trade.get("peak_price") or entry_price), current)
+        # ── Update rolling extremes ───────────────────────────────────────────
+        peak   = max(float(trade.get("peak_price")   or entry_price), current)
         trough = min(float(trade.get("trough_price") or entry_price), current)
         if peak != trade.get("peak_price") or trough != trade.get("trough_price"):
             db.update_trade_extremes(trade_id, peak, trough)
 
-        # Hard stoploss
+        # ── Profit-based trailing stop tracking ──────────────────────────────
+        # high_since_entry / low_since_entry tracks the best price seen
+        if side == "long":
+            high_since = max(float(trade.get("high_since_entry") or entry_price), current)
+        else:
+            low_since  = min(float(trade.get("low_since_entry") or entry_price), current)
+
+        # Update DB trackers
+        if side == "long":
+            if high_since != (trade.get("high_since_entry") or entry_price):
+                db.update_trade_profit_tracker(trade_id, high_since, 0)
+        else:
+            ls = float(trade.get("low_since_entry") or entry_price)
+            if low_since != ls:
+                db.update_trade_profit_tracker(trade_id, 0, low_since)
+
+        # ── Partial derisk close at 50% of ATR stop distance ─────────────────
+        # E.g. if ATR stop is -1.2%, trigger partial at -0.6%
+        # Only do this once per trade (derisk_closed flag)
+        if derisk_enabled and not trade.get("derisk_closed"):
+            # Use the stored stop distance as reference
+            # ATR stop was entry ± atr*1.5. Approximate half-stop as sl_pct/2.
+            half_stop = sl_pct / 2
+            if profit_pct <= -half_stop:
+                amount_remaining = float(trade.get("amount") or 0)
+                if amount_remaining > 0:
+                    close_fraction = 0.5  # close 50% of position
+                    derisk.append((trade_id, current, "derisk_partial", close_fraction))
+                    db.mark_trade_derisked(trade_id, amount_remaining * (1 - close_fraction))
+                    log.info(f"[Derisk] ⚠️ {pair} {side.upper()} partial close 50% at "
+                             f"profit={profit_pct:.2%} (half_stop={half_stop:.2%})")
+                    # Don't full-close yet, continue to remaining checks
+                    continue
+
+        # ── Hard stoploss ─────────────────────────────────────────────────────
         if profit_pct <= -sl_pct:
             exits.append((trade_id, current, "stoploss"))
             continue
 
-        # Trailing stop: track max favorable excursion since entry.
+        # ── Profit-based trailing stop (NFI-inspired) ─────────────────────────
+        # Phase 1: at +be_trigger (2%) → move stop to breakeven
+        # Phase 2: at +trail_trigger (4%) → trail at peak/trough - trail_offset (1%)
         if side == "long":
-            best_profit_pct = (peak - entry_price) / entry_price
-            trail_price = peak * (1 - trail_pct)
-            if best_profit_pct >= trail_offset and current <= trail_price:
-                exits.append((trade_id, current, "trailing_stop"))
-                continue
+            best_profit = (high_since - entry_price) / entry_price
+            if best_profit >= trail_trigger:
+                # Phase 2: tight trail
+                trail_price = high_since * (1 - trail_offset)
+                if current <= trail_price:
+                    exits.append((trade_id, current, "profit_trail"))
+                    continue
+            elif best_profit >= be_trigger:
+                # Phase 1: breakeven stop
+                if current <= entry_price:
+                    exits.append((trade_id, current, "breakeven_stop"))
+                    continue
         else:
-            best_profit_pct = (entry_price - trough) / entry_price
-            trail_price = trough * (1 + trail_pct)
-            if best_profit_pct >= trail_offset and current >= trail_price:
-                exits.append((trade_id, current, "trailing_stop"))
-                continue
+            best_profit = (entry_price - low_since) / entry_price
+            if best_profit >= trail_trigger:
+                # Phase 2: tight trail
+                trail_price = low_since * (1 + trail_offset)
+                if current >= trail_price:
+                    exits.append((trade_id, current, "profit_trail"))
+                    continue
+            elif best_profit >= be_trigger:
+                # Phase 1: breakeven stop
+                if current >= entry_price:
+                    exits.append((trade_id, current, "breakeven_stop"))
+                    continue
 
-        # Signal-based exit
+        # ── Signal-based exit ─────────────────────────────────────────────────
         df = df5m.get(pair)
         if df is not None and len(df) > 0:
             row = df.iloc[-1]
@@ -983,35 +1089,27 @@ def check_exits(open_trades: List[Dict], df5m: Dict[str, pd.DataFrame],
                     exits.append((trade_id, current, "signal"))
                     continue
 
-        # ROI exit (minimal_roi equivalent)
+        # ── ROI exit (minimal_roi equivalent) ────────────────────────────────
         roi_map = {0: 0.015, 10: 0.010, 30: 0.005, 60: 0.0}
-        # Minutes since entry
         try:
             entry_dt = datetime.fromisoformat(trade["entry_time"])
             if entry_dt.tzinfo is None:
                 entry_dt = entry_dt.replace(tzinfo=timezone.utc)
-            now_utc = current_time if current_time.tzinfo else current_time.replace(tzinfo=timezone.utc)
-            now_utc = now_utc.astimezone(timezone.utc)
-            mins = (now_utc - entry_dt).total_seconds() / 60
+            mins = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 60
         except Exception:
             mins = 0
-        if max_trade_duration_min and mins >= max_trade_duration_min:
-            if profit_pct <= time_stop_min_profit:
-                exits.append((trade_id, current, "time_stop"))
-                continue
         for threshold_min in sorted(roi_map.keys(), reverse=True):
             if mins >= threshold_min:
                 if profit_pct >= roi_map[threshold_min]:
                     exits.append((trade_id, current, "roi"))
                 break
 
-        # Max hold time — cut the trade regardless of P&L to avoid trades
-        # drifting open for days. Prefer a small loss over an uncapped one.
+        # ── Max hold time ─────────────────────────────────────────────────────
         if mins >= max_hold_hours * 60:
             exits.append((trade_id, current, "max_hold"))
             continue
 
-    return exits
+    return exits, derisk
 
 
 # ── Safety gates ─────────────────────────────────────────────────────────────
@@ -1023,8 +1121,6 @@ def safety_ok(pair: str, current_time: datetime) -> Tuple[bool, str]:
     p = db.get_all_params()
     max_consec   = int(p.get("max_consec_losses", "4"))
     cooldown_min = int(p.get("pair_cooldown_min", "15"))
-    max_pair_day = int(p.get("max_trades_per_pair_per_day", "4"))
-    max_day = int(p.get("max_trades_per_day", "12"))
     _prune_api_errors(current_time.astimezone(timezone.utc) if current_time.tzinfo else current_time.replace(tzinfo=timezone.utc))
 
     utc = current_time.replace(tzinfo=timezone.utc) if current_time.tzinfo is None \
@@ -1042,14 +1138,6 @@ def safety_ok(pair: str, current_time: datetime) -> Tuple[bool, str]:
 
     if len(_api_error_times) >= MAX_API_ERRORS_PER_HOUR:
         return False, f"api_error_limit_{MAX_API_ERRORS_PER_HOUR}_per_hour"
-
-    today_str = utc.date().isoformat()
-    pair_trade_count = db.count_trades_for_day(today_str, pair)
-    if pair_trade_count >= max_pair_day:
-        return False, f"pair_daily_trade_cap_{max_pair_day}"
-    day_trade_count = db.count_trades_for_day(today_str)
-    if day_trade_count >= max_day:
-        return False, f"daily_trade_cap_{max_day}"
 
     # Consecutive loss halt
     if _consec_loss_halt_until is not None:
@@ -1407,11 +1495,15 @@ def run():
             active_pairs = db.get_active_pairs()
             fetch_pairs = active_pairs if BTC_PAIR in active_pairs else [BTC_PAIR] + active_pairs
 
-            # ── 1. Fetch BTC 1h for regime ────────────────────────────────────
+            # ── 1. Fetch BTC 1h for regime + BTC context filter ──────────────
             btc_1h_df = fetch_ohlcv(exchange, BTC_PAIR, "1h", limit=CANDLES_1H)
             if btc_1h_df is not None:
                 btc_1h_df = compute_1h_indicators(btc_1h_df)
             btc_regime_label = btc_regime(btc_1h_df)
+            btc_ema_period   = int(p.get("btc_ema_period", "20"))
+            btc_ctx          = compute_btc_1h_context(btc_1h_df, ema_period=btc_ema_period)
+            log.info(f"[BTC] regime={btc_regime_label} | above_ema20={btc_ctx['btc_above_ema']} "
+                     f"| ok_long={btc_ctx['btc_ok_for_longs']} ok_short={btc_ctx['btc_ok_for_shorts']}")
 
             # ── 2. Fetch and cache candles + funding rates ────────────────────
             df5m: Dict[str, pd.DataFrame] = {}
@@ -1457,14 +1549,44 @@ def run():
 
             # ── 3. Manage open positions ──────────────────────────────────────
             open_trades = db.get_open_trades()
-            exits = check_exits(open_trades, df5m, current_prices, now)
+            exits, derisk_closes = check_exits(open_trades, df5m, current_prices)
 
+            # ── 3a. Handle partial derisk closes ─────────────────────────────
+            for trade_id, exit_price, reason, close_fraction in derisk_closes:
+                trade = next((t for t in open_trades if t["id"] == trade_id), None)
+                if not trade:
+                    continue
+                partial_amount = float(trade.get("amount") or 0) * close_fraction
+                if partial_amount <= 0:
+                    continue
+                close_ok = close_order(exchange, trade["pair"], trade["side"],
+                                       partial_amount, exit_price, reason,
+                                       "")   # don't cancel stop for partial
+                if close_ok:
+                    trade_side = trade["side"]
+                    entry_p    = trade["entry_price"]
+                    stake      = trade["stake_usdt"] * close_fraction
+                    lev        = trade["leverage"]
+                    if trade_side == "long":
+                        partial_pnl = (exit_price - entry_p) / entry_p * stake * lev
+                    else:
+                        partial_pnl = (entry_p - exit_price) / entry_p * stake * lev
+                    log.info(f"⚠️ DERISK {trade_side.upper()} {trade['pair']} "
+                             f"closed {close_fraction:.0%} @ {exit_price:.4f} "
+                             f"| partial P&L={partial_pnl:+.2f} USDT")
+                    tg.trade_closed(trade["pair"], trade_side, entry_p, exit_price,
+                                    partial_pnl, partial_pnl / stake * 100 if stake else 0,
+                                    "derisk_partial", DRY_RUN)
+
+            # ── 3b. Handle full exits ─────────────────────────────────────────
             for trade_id, exit_price, reason in exits:
                 trade = next((t for t in open_trades if t["id"] == trade_id), None)
                 if not trade:
                     continue
+                # Use derisk_amount if partial close was done, else full amount
+                exit_amount = float(trade.get("derisk_amount") or trade.get("amount") or 0)
                 close_ok = close_order(exchange, trade["pair"], trade["side"],
-                                       trade["amount"], exit_price, reason,
+                                       exit_amount, exit_price, reason,
                                        trade.get("stop_order_id") or "")
                 if not close_ok:
                     log.error(f"[Order] Trade #{trade_id} remains open because exchange close failed")
@@ -1496,19 +1618,10 @@ def run():
             # Reload open trades after exits
             open_trades = db.get_open_trades()
             open_pairs  = {t["pair"] for t in open_trades}
-            total_profit = sum(
-                t.get("profit_usdt", 0) or 0
-                for t in db.get_closed_trades_for_day(now.date().isoformat())
-            )
-            wallet_now = wallet_start + total_profit
 
             # ── 4. Evaluate entry signals ─────────────────────────────────────
             max_open  = int(p.get("max_open_trades", "3"))
-            base_stake = float(p.get("stake_usdt", "200"))
-            stake     = risk_adjusted_stake(base_stake, wallet_now, p)
-            if stake < base_stake:
-                log.info(f"[Risk] Stake capped from {base_stake:.2f} to {stake:.2f} USDT "
-                         f"by max_risk_per_trade_pct={p.get('max_risk_per_trade_pct', '1.0')}")
+            stake     = float(p.get("stake_usdt", "200"))
             leverage  = int(p.get("leverage", "5"))
 
             if len(open_trades) < max_open:
@@ -1546,7 +1659,8 @@ def run():
                     # (already checked above — if we're here it was new)
 
                     sigs = evaluate_signals(pair, df, btc_regime_label, p_regime,
-                                            p15_regime, p4_regime, p)
+                                            p15_regime, p4_regime, p,
+                                            btc_context=btc_ctx)
                     if not sigs:
                         skip_reason, no_signal_context = diagnose_no_signal(
                             pair, df, p, btc_regime_label, p_regime,
@@ -1560,65 +1674,6 @@ def run():
                     for sig in sigs:
                         if len(open_trades) >= max_open:
                             break
-
-                        confidence, score_reasons = score_signal(
-                            sig, btc_regime_label, p_regime, p15_regime,
-                            p4_regime, p
-                        )
-                        sig["confidence"] = confidence
-                        sig["confidence_reasons"] = score_reasons
-                        min_conf = float(p.get("min_signal_confidence", "0.62"))
-                        if confidence < min_conf:
-                            log.info(f"[Signal] ⛔ {sig['entry_tag']} {pair} blocked: "
-                                     f"confidence={confidence:.2f}<{min_conf:.2f} "
-                                     f"({','.join(score_reasons)})")
-                            db.log_signal(
-                                pair=pair, direction=sig["direction"],
-                                fired=False, skip_reason="low_confidence",
-                                price=sig["price"], rsi=sig["rsi"],
-                                bb_pct=sig["bb_pct"], ema_gap=sig["ema_gap"],
-                                atr_pct=sig["atr_pct"], vwap_dev=sig["vwap_dev"],
-                                volume_ratio=sig["vol_ratio"],
-                                btc_regime=btc_regime_label, session=sig["session"],
-                                context={
-                                    "confidence": confidence,
-                                    "confidence_reasons": score_reasons,
-                                    "min_signal_confidence": min_conf,
-                                    "signal": sig,
-                                },
-                            )
-                            log_decision_snapshot(
-                                pair, df, p, btc_regime_label, p15_regime,
-                                p_regime, p4_regime, sig["entry_tag"], False,
-                                "low_confidence",
-                                {"signal": sig, "confidence": confidence}
-                            )
-                            continue
-
-                        setup_ok, setup_reason, setup_perf = setup_allowed(sig, p)
-                        if not setup_ok:
-                            log.info(f"[Signal] ⛔ {sig['entry_tag']} {pair} blocked: "
-                                     f"{setup_reason} {setup_perf}")
-                            db.log_signal(
-                                pair=pair, direction=sig["direction"],
-                                fired=False, skip_reason=setup_reason,
-                                price=sig["price"], rsi=sig["rsi"],
-                                bb_pct=sig["bb_pct"], ema_gap=sig["ema_gap"],
-                                atr_pct=sig["atr_pct"], vwap_dev=sig["vwap_dev"],
-                                volume_ratio=sig["vol_ratio"],
-                                btc_regime=btc_regime_label, session=sig["session"],
-                                context={
-                                    "setup_performance": setup_perf,
-                                    "signal": sig,
-                                },
-                            )
-                            log_decision_snapshot(
-                                pair, df, p, btc_regime_label, p15_regime,
-                                p_regime, p4_regime, sig["entry_tag"], False,
-                                setup_reason,
-                                {"signal": sig, "setup_performance": setup_perf}
-                            )
-                            continue
 
                         direction  = sig["direction"]
                         entry_tag  = sig["entry_tag"]
@@ -1659,17 +1714,17 @@ def run():
                         actual_stake = _risk_based_stake(price, stop_px, risk_usdt,
                                                          leverage, stake)
 
-                        funding_part = (
-                            f"| funding={funding_rate:.4%} "
-                            if funding_rate is not None else ""
-                        )
                         log.info(f"🔔 SIGNAL {direction.upper()} {pair} "
                                  f"| tag={entry_tag} | price={price:.4f} "
                                  f"| rsi={sig['rsi']:.1f} | atr={sig['atr_pct']:.2f}% "
-                                 f"| confidence={confidence:.2f} "
                                  f"| stop={stop_px:.4f} ({stop_pct:.2f}%) "
                                  f"| stake={actual_stake:.1f} USDT (risk={risk_usdt} USDT) "
-                                 f"{funding_part}"
+                                 f"| funding={funding_rate:.4%}" if funding_rate is not None
+                                 else f"🔔 SIGNAL {direction.upper()} {pair} "
+                                 f"| tag={entry_tag} | price={price:.4f} "
+                                 f"| rsi={sig['rsi']:.1f} | atr={sig['atr_pct']:.2f}% "
+                                 f"| stop={stop_px:.4f} ({stop_pct:.2f}%) "
+                                 f"| stake={actual_stake:.1f} USDT (risk={risk_usdt} USDT) "
                                  f"| regime=BTC:{btc_regime_label} pair:{p_regime}")
 
                         order = place_order(exchange, pair, direction,
@@ -1724,9 +1779,6 @@ def run():
                                     "pair_15m_regime": p15_regime,
                                     "pair_1h_regime": p_regime,
                                     "pair_4h_regime": p4_regime,
-                                    "confidence": confidence,
-                                    "confidence_reasons": score_reasons,
-                                    "setup_performance": setup_perf,
                                     "params": p,
                                 },
                             )
@@ -1745,6 +1797,11 @@ def run():
                             )
 
             # ── 5. Check daily loss limit ─────────────────────────────────────
+            total_profit = sum(
+                t.get("profit_usdt", 0) or 0
+                for t in db.get_closed_trades_for_day(now.date().isoformat())
+            )
+            wallet_now = wallet_start + total_profit
             check_daily_loss(wallet_start, wallet_now)
 
             # ── 6. Store indicator snapshot for dashboard ─────────────────────

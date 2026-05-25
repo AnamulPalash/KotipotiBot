@@ -170,6 +170,11 @@ def init_db():
         ("estimated_fee_usdt", "REAL"),
         ("estimated_slippage_usdt", "REAL"),
         ("bot_variant",        "TEXT"),
+        # Profit-trailing stop tracking
+        ("high_since_entry",   "REAL"),   # highest price seen while in long trade
+        ("low_since_entry",    "REAL"),   # lowest price seen while in short trade
+        ("derisk_closed",      "INTEGER"),# 1 if partial derisk close already done
+        ("derisk_amount",      "REAL"),   # amount remaining after partial close
     ]
     with _conn() as conn:
         existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
@@ -188,55 +193,73 @@ def init_db():
 
     # Seed default params if not present
     defaults = {
-        "signal_profile":     os.environ.get("SIGNAL_PROFILE", "balanced"),
-        "confirmation_mode":  "hard",
-        "rsi_short_entry":    "68",
-        "rsi_long_entry":     "32",
-        "vwap_rsi_short":     "62",
-        "vwap_rsi_long":      "38",
-        "trend_rsi_long":     "55",
-        "trend_rsi_short":    "45",
-        "trend_rsi_max_long": "64",
-        "trend_rsi_min_short": "36",
-        "active_min_volume_ratio": "0.8",
+        "signal_profile":     os.environ.get("SIGNAL_PROFILE", "active_dry_run"),
+        "confirmation_mode":  "soft",
+        "rsi_short_entry":    "58",
+        "rsi_long_entry":     "42",
+        "vwap_rsi_short":     "55",
+        "vwap_rsi_long":      "45",
+        "trend_rsi_long":     "52",
+        "trend_rsi_short":    "48",
+        "trend_rsi_max_long": "68",
+        "trend_rsi_min_short": "32",
+        "active_min_volume_ratio": "0.05",
         "rsi_exit_short":     "45",
         "rsi_exit_long":      "55",
         "bb_period":          "20",
         "bb_std":             "2.0",
         "ema_fast":           "8",
         "ema_slow":           "21",
-        "volume_multiplier":  "1.2",
+        "volume_multiplier":  "0.8",
         "atr_period":         "14",
         "atr_min_pct":        "0.1",   # block if ATR% < this (too quiet)
         "atr_max_pct":        "6.0",   # block if ATR% > this (too wild)
-        "vwap_dev_min":       "0.35",  # min % deviation for VWAP signal
-        "stoploss_pct":       "2.5",
-        "trailing_pct":       "1.0",
-        "trailing_offset":    "1.5",
-        "leverage":           "5",
-        "max_open_trades":    "3",
-        "stake_usdt":         os.environ.get("STAKE_USDT", "200"),
-        "daily_loss_limit":   "10.0",  # % of wallet
-        "max_consec_losses":  "4",
-        "pair_cooldown_min":  "15",
-        "max_trades_per_pair_per_day": "4",
-        "max_trades_per_day": "12",
-        "min_signal_confidence": "0.62",
-        "min_setup_trades": "8",
-        "min_setup_win_rate": "35.0",
-        "max_risk_per_trade_pct": "1.0",
-        "max_trade_duration_min": "180",
-        "time_stop_min_profit_pct": "0.0",
-        "max_hold_hours":     "6.0",   # force-close after N hours
-        "atr_stop_multiplier": "1.5",  # stop = entry ± ATR * multiplier
-        "risk_per_trade_usdt": "50",   # max USDT to risk per trade at stop
-        "funding_rate_threshold": "0.0005", # 0.05% — skip crowded longs/shorts
-        "blocked_sessions":   "[]",    # JSON list e.g. '["Asia"]'
-        "hermes_auto_apply":   "false", # require review before Hermes changes params
-        "bot_variant":         os.environ.get("BOT_VARIANT", "codex_v2_balanced"),
-        "taker_fee_bps":       os.environ.get("TAKER_FEE_BPS", "5.5"),
-        "slippage_bps":        os.environ.get("SLIPPAGE_BPS", "2.0"),
-        "wallet_start":        os.environ.get("DRY_RUN_WALLET", "5000"),
+        "vwap_dev_min":       "0.15",  # min % deviation for VWAP signal
+        "stoploss_pct":            "1.2",
+        "trailing_pct":            "1.0",
+        "trailing_offset":         "1.5",
+        "leverage":                "5",
+        "max_open_trades":         "3",
+        "stake_usdt":              os.environ.get("STAKE_USDT", "500"),
+        "daily_loss_limit":        "10.0",  # % of wallet
+        "max_consec_losses":       "4",
+        "pair_cooldown_min":       "15",
+        "max_hold_hours":          "6.0",   # force-close after N hours
+        "blocked_sessions":        "[]",    # JSON list e.g. '["Asia"]'
+        "hermes_auto_apply":       "false", # require review before Hermes changes params
+        "bot_variant":             os.environ.get("BOT_VARIANT", "codex_v2_active"),
+        "taker_fee_bps":           os.environ.get("TAKER_FEE_BPS", "5.5"),
+        "slippage_bps":            os.environ.get("SLIPPAGE_BPS", "2.0"),
+        "wallet_start":            os.environ.get("DRY_RUN_WALLET", "5000"),
+        # ATR-based dynamic stop
+        "atr_stop_multiplier":     "1.5",   # stop = entry ± ATR * multiplier
+        # Fixed-risk position sizing
+        "risk_per_trade_usdt":     "50",    # max USDT to risk per trade at stop
+        # Funding rate filter
+        "funding_rate_threshold":  "0.0005", # 0.05% — skip crowded longs/shorts
+        # BTC context filter (NFI-inspired)
+        "btc_context_enabled":     "true",  # skip longs if BTC below its 1h EMA
+        "btc_ema_period":          "20",    # EMA period for BTC 1h trend
+        # Safe dip/pump filter (NFI-inspired)
+        "safe_dip_enabled":        "true",  # skip longs on falling knives
+        "safe_pump_enabled":       "true",  # skip shorts on vertical pumps
+        "safe_dip_threshold":      "0.12",  # skip long if price dropped >12% from 6h high
+        "safe_pump_threshold":     "0.15",  # skip short if price pumped >15% from 6h low
+        # Profit-based trailing stop
+        "breakeven_trigger_pct":   "2.0",   # move stop to breakeven at +2% profit
+        "trail_trigger_pct":       "4.0",   # start trailing at +4% profit
+        "trail_offset_pct":        "1.0",   # trail stop = peak - 1%
+        # Partial derisk close
+        "derisk_enabled":          "true",  # partial close at 50% of stop distance
+        # EWO filter on VWAP signals
+        "ewo_filter_enabled":      "true",  # require EWO > -2 for vwap_long, < 2 for vwap_short
+        "ewo_long_min":            "-2.0",  # vwap_long: EWO must be > this
+        "ewo_short_max":           "2.0",   # vwap_short: EWO must be < this
+        # CTI (Composite Trend Indicator) quality gate
+        "cti_filter_enabled":      "true",  # pearson correlation of price vs linear trend
+        "cti_long_max":            "-0.5",  # skip long if CTI < -0.5 (strong downtrend)
+        "cti_short_min":           "0.5",   # skip short if CTI > 0.5 (strong uptrend)
+        "cti_period":              "20",    # CTI lookback period
     }
     with _conn() as conn:
         now = _now()
@@ -247,9 +270,9 @@ def init_db():
             )
 
         dry_run = os.environ.get("DRY_RUN", "true").lower() != "false"
-        apply_active = os.environ.get("APPLY_ACTIVE_DRY_RUN_PROFILE", "false").lower() == "true"
+        apply_active = os.environ.get("APPLY_ACTIVE_DRY_RUN_PROFILE", "true").lower() != "false"
         profile_done = conn.execute(
-            "SELECT value FROM bot_state WHERE key='migration_active_dry_run_profile_v2'"
+            "SELECT value FROM bot_state WHERE key='migration_active_dry_run_profile_v3'"
         ).fetchone()
         if dry_run and apply_active and profile_done is None:
             active_updates = {
@@ -270,6 +293,24 @@ def init_db():
                 "vwap_dev_min": "0.15",
                 "stake_usdt": os.environ.get("STAKE_USDT", "500"),
                 "wallet_start": os.environ.get("DRY_RUN_WALLET", "5000"),
+                # NFI-inspired improvements
+                "btc_context_enabled":   "true",
+                "btc_ema_period":        "20",
+                "safe_dip_enabled":      "true",
+                "safe_pump_enabled":     "true",
+                "safe_dip_threshold":    "0.12",
+                "safe_pump_threshold":   "0.15",
+                "breakeven_trigger_pct": "2.0",
+                "trail_trigger_pct":     "4.0",
+                "trail_offset_pct":      "1.0",
+                "derisk_enabled":        "true",
+                "ewo_filter_enabled":    "true",
+                "ewo_long_min":          "-2.0",
+                "ewo_short_max":         "2.0",
+                "cti_filter_enabled":    "true",
+                "cti_long_max":          "-0.5",
+                "cti_short_min":         "0.5",
+                "cti_period":            "20",
             }
             for k, v in active_updates.items():
                 conn.execute(
@@ -278,58 +319,7 @@ def init_db():
                 )
             conn.execute(
                 "INSERT OR REPLACE INTO bot_state(key, value) VALUES (?,?)",
-                ("migration_active_dry_run_profile_v2", now)
-            )
-
-        apply_balanced = os.environ.get("APPLY_BALANCED_SAFETY_PROFILE", "true").lower() != "false"
-        balanced_done = conn.execute(
-            "SELECT value FROM bot_state WHERE key='migration_balanced_safety_profile_v1'"
-        ).fetchone()
-        current_profile = conn.execute(
-            "SELECT value FROM params WHERE key='signal_profile'"
-        ).fetchone()
-        should_balance = (
-            apply_balanced and balanced_done is None and
-            (current_profile is None or current_profile["value"] == "active_dry_run")
-        )
-        if should_balance:
-            balanced_updates = {
-                "signal_profile": "balanced",
-                "confirmation_mode": "hard",
-                "rsi_short_entry": "68",
-                "rsi_long_entry": "32",
-                "vwap_rsi_short": "62",
-                "vwap_rsi_long": "38",
-                "trend_rsi_long": "55",
-                "trend_rsi_short": "45",
-                "trend_rsi_max_long": "64",
-                "trend_rsi_min_short": "36",
-                "active_min_volume_ratio": "0.8",
-                "volume_multiplier": "1.2",
-                "vwap_dev_min": "0.35",
-                "max_trades_per_pair_per_day": "4",
-                "max_trades_per_day": "12",
-                "min_signal_confidence": "0.62",
-                "min_setup_trades": "8",
-                "min_setup_win_rate": "35.0",
-                "max_risk_per_trade_pct": "1.0",
-                "max_trade_duration_min": "180",
-                "time_stop_min_profit_pct": "0.0",
-                "max_hold_hours": "6.0",
-                "atr_stop_multiplier": "1.5",
-                "risk_per_trade_usdt": "50",
-                "funding_rate_threshold": "0.0005",
-                "stake_usdt": os.environ.get("STAKE_USDT", "200"),
-                "bot_variant": os.environ.get("BOT_VARIANT", "codex_v2_balanced"),
-            }
-            for k, v in balanced_updates.items():
-                conn.execute(
-                    "INSERT OR REPLACE INTO params(key, value, updated_at, updated_by) VALUES (?,?,?,?)",
-                    (k, v, now, "safety_migration")
-                )
-            conn.execute(
-                "INSERT OR REPLACE INTO bot_state(key, value) VALUES (?,?)",
-                ("migration_balanced_safety_profile_v1", now)
+                ("migration_active_dry_run_profile_v3", now)
             )
 
 
@@ -394,18 +384,6 @@ PARAM_SCHEMA = {
     "daily_loss_limit":   {"type": float, "min": 0.1, "max": 100.0},
     "max_consec_losses":  {"type": int,   "min": 1,  "max": 50},
     "pair_cooldown_min":  {"type": int,   "min": 0,  "max": 1440},
-    "max_trades_per_pair_per_day": {"type": int, "min": 1, "max": 100},
-    "max_trades_per_day": {"type": int, "min": 1, "max": 500},
-    "min_signal_confidence": {"type": float, "min": 0.0, "max": 1.0},
-    "min_setup_trades": {"type": int, "min": 1, "max": 500},
-    "min_setup_win_rate": {"type": float, "min": 0.0, "max": 100.0},
-    "max_risk_per_trade_pct": {"type": float, "min": 0.1, "max": 25.0},
-    "max_trade_duration_min": {"type": int, "min": 5, "max": 10080},
-    "time_stop_min_profit_pct": {"type": float, "min": -100.0, "max": 100.0},
-    "max_hold_hours": {"type": float, "min": 0.1, "max": 168.0},
-    "atr_stop_multiplier": {"type": float, "min": 0.1, "max": 10.0},
-    "risk_per_trade_usdt": {"type": float, "min": 1.0, "max": 100000.0},
-    "funding_rate_threshold": {"type": float, "min": 0.0, "max": 1.0},
     "blocked_sessions":   {"type": "json_list", "allowed": {"Asia", "London", "US"}},
     "hermes_auto_apply":  {"type": "bool"},
     "bot_variant":        {"type": "text", "max_len": 64},
@@ -545,6 +523,27 @@ def update_trade_extremes(trade_id: int, peak_price: float, trough_price: float)
             (peak_price, trough_price, trade_id)
         )
 
+
+def update_trade_profit_tracker(trade_id: int, high_since_entry: float,
+                                 low_since_entry: float):
+    """Update rolling high/low trackers used for profit-based trailing stop."""
+    with _conn() as conn:
+        conn.execute(
+            """UPDATE trades SET high_since_entry=?, low_since_entry=?
+               WHERE id=? AND is_open=1""",
+            (high_since_entry, low_since_entry, trade_id)
+        )
+
+
+def mark_trade_derisked(trade_id: int, remaining_amount: float):
+    """Mark that the partial derisk close has been done for this trade."""
+    with _conn() as conn:
+        conn.execute(
+            """UPDATE trades SET derisk_closed=1, derisk_amount=?
+               WHERE id=? AND is_open=1""",
+            (remaining_amount, trade_id)
+        )
+
 def get_recent_trades(limit: int = 50) -> List[Dict]:
     with _conn() as conn:
         rows = conn.execute(
@@ -569,39 +568,6 @@ def get_closed_trades_for_day(day: str) -> List[Dict]:
             ORDER BY exit_time DESC
         """, (day,)).fetchall()
     return [dict(r) for r in rows]
-
-
-def count_trades_for_day(day: str, pair: str = None) -> int:
-    """Count opened trades for a UTC day, including trades still open."""
-    sql = "SELECT COUNT(*) AS n FROM trades WHERE substr(entry_time, 1, 10)=?"
-    args = [day]
-    if pair is not None:
-        sql += " AND pair=?"
-        args.append(pair)
-    with _conn() as conn:
-        row = conn.execute(sql, args).fetchone()
-    return int(row["n"] if row else 0)
-
-
-def get_setup_performance(entry_tag: str, limit: int = 50) -> Dict:
-    """Return closed-trade performance for an entry setup."""
-    with _conn() as conn:
-        rows = conn.execute("""
-            SELECT profit_usdt, profit_pct
-            FROM trades
-            WHERE is_open=0 AND entry_tag=?
-            ORDER BY exit_time DESC
-            LIMIT ?
-        """, (entry_tag, limit)).fetchall()
-    profits = [float(r["profit_usdt"] or 0) for r in rows]
-    if not profits:
-        return {"trade_count": 0, "win_rate": None, "total_profit_usdt": 0.0}
-    wins = [p for p in profits if p > 0]
-    return {
-        "trade_count": len(profits),
-        "win_rate": round(len(wins) / len(profits) * 100, 1),
-        "total_profit_usdt": round(sum(profits), 4),
-    }
 
 
 # ── Signal helpers ────────────────────────────────────────────────────────────

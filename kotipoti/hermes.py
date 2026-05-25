@@ -14,6 +14,9 @@ Analysis performed:
   - Signal accuracy (fired signals that became profitable vs not)
   - Average holding time winners vs losers
   - Best/worst ATR range for entries
+  - RSI at entry buckets (short and long separately)
+  - Volume ratio at entry buckets
+  - VWAP deviation at entry buckets
 
 Auto-tuning bounds (Hermes never goes outside these):
   - rsi_short_entry:   60 – 75
@@ -21,6 +24,7 @@ Auto-tuning bounds (Hermes never goes outside these):
   - volume_multiplier: 1.0 – 2.0
   - atr_min_pct:       0.2 – 0.8
   - atr_max_pct:       2.0 – 5.0
+  - vwap_dev_min:      0.3 – 2.0
 """
 
 import threading
@@ -36,8 +40,9 @@ import telegram as tg
 
 log = logging.getLogger("kotipoti.hermes")
 
-HERMES_INTERVAL_H = 6     # run analysis every 6 hours
-MIN_TRADES_FOR_TUNING = 10 # don't tune until we have enough data
+HERMES_INTERVAL_H = 6      # run analysis every 6 hours
+MIN_TRADES_FOR_TUNING = 10  # don't tune until we have enough data
+MIN_BUCKET_TRADES = 4       # minimum trades in a bucket to trust its stats
 
 # Safe tuning bounds — Hermes never exceeds these
 PARAM_BOUNDS = {
@@ -58,6 +63,33 @@ STEP = {
     "vwap_dev_min":      0.1,
 }
 
+# Representative mid-point values for each bucket — used to map best bucket → param value
+RSI_SHORT_BUCKET_VALUES = {
+    "<65":   63.0,
+    "65-70": 67.5,
+    "70-75": 72.5,
+    "75+":   76.0,
+}
+RSI_LONG_BUCKET_VALUES = {
+    ">35":   37.0,
+    "30-35": 32.5,
+    "25-30": 27.5,
+    "<25":   24.0,
+}
+VOL_BUCKET_VALUES = {
+    "1.0-1.5x": 1.2,
+    "1.5-2.0x": 1.7,
+    "2.0-3.0x": 2.4,
+    "3.0x+":    3.2,
+}
+VWAP_BUCKET_VALUES = {
+    "<0.5%":    0.3,
+    "0.5-1.0%": 0.75,
+    "1.0-1.5%": 1.25,
+    "1.5-2.0%": 1.75,
+    "2.0%+":    2.3,
+}
+
 
 def _win_rate(trades: List[Dict]) -> float:
     if not trades:
@@ -72,13 +104,38 @@ def _avg_profit(trades: List[Dict]) -> float:
     return sum((t.get("profit_usdt") or 0) for t in trades) / len(trades)
 
 
+def _bucket_summary(buckets: Dict[str, List]) -> Dict:
+    return {
+        b: {
+            "count":      len(ts),
+            "win_rate":   round(_win_rate(ts), 1),
+            "avg_profit": round(_avg_profit(ts), 3),
+        }
+        for b, ts in buckets.items()
+    }
+
+
+def _best_bucket(bucket_findings: Dict, bucket_values: Dict,
+                 min_trades: int = MIN_BUCKET_TRADES) -> Optional[float]:
+    """Return the representative value of the bucket with the highest win rate.
+    Only considers buckets with at least min_trades trades. Returns None if no
+    bucket qualifies."""
+    best_wr  = -1.0
+    best_val = None
+    for b, stats in bucket_findings.items():
+        if stats["count"] >= min_trades and stats["win_rate"] > best_wr:
+            best_wr  = stats["win_rate"]
+            best_val = bucket_values.get(b)
+    return best_val
+
+
 def analyse() -> Dict:
     """Run full performance analysis. Returns findings dict."""
     trades = db.get_all_closed_trades()
     findings = {
-        "ts":           datetime.now(timezone.utc).isoformat(),
-        "total_trades": len(trades),
-        "overall_win_rate": _win_rate(trades),
+        "ts":                datetime.now(timezone.utc).isoformat(),
+        "total_trades":      len(trades),
+        "overall_win_rate":  _win_rate(trades),
         "total_profit_usdt": sum((t.get("profit_usdt") or 0) for t in trades),
     }
 
@@ -164,7 +221,7 @@ def analyse() -> Dict:
     findings["avg_hold_min_losers"]  = round(
         sum(hold_times_lose) / len(hold_times_lose), 1) if hold_times_lose else None
 
-    # ── ATR analysis: best entry range ───────────────────────────────────────
+    # ── ATR analysis: best entry range ────────────────────────────────────────
     atr_buckets: Dict[str, List] = defaultdict(list)
     for t in trades:
         atr = t.get("atr_at_entry")
@@ -182,14 +239,61 @@ def analyse() -> Dict:
             bucket = "very_high"
         atr_buckets[bucket].append(t)
 
-    findings["by_atr_bucket"] = {
-        b: {
-            "count":      len(ts),
-            "win_rate":   round(_win_rate(ts), 1),
-            "avg_profit": round(_avg_profit(ts), 3),
-        }
-        for b, ts in atr_buckets.items()
-    }
+    findings["by_atr_bucket"] = _bucket_summary(atr_buckets)
+
+    # ── RSI at entry buckets ──────────────────────────────────────────────────
+    rsi_short_buckets: Dict[str, List] = defaultdict(list)
+    rsi_long_buckets:  Dict[str, List] = defaultdict(list)
+    for t in trades:
+        rsi  = t.get("rsi_at_entry")
+        side = t.get("side", "")
+        if rsi is None:
+            continue
+        if side == "short":
+            if rsi < 65:        b = "<65"
+            elif rsi < 70:      b = "65-70"
+            elif rsi < 75:      b = "70-75"
+            else:               b = "75+"
+            rsi_short_buckets[b].append(t)
+        elif side == "long":
+            if rsi > 35:        b = ">35"
+            elif rsi > 30:      b = "30-35"
+            elif rsi > 25:      b = "25-30"
+            else:               b = "<25"
+            rsi_long_buckets[b].append(t)
+
+    findings["by_rsi_short_bucket"] = _bucket_summary(rsi_short_buckets)
+    findings["by_rsi_long_bucket"]  = _bucket_summary(rsi_long_buckets)
+
+    # ── Volume ratio at entry buckets ─────────────────────────────────────────
+    vol_buckets: Dict[str, List] = defaultdict(list)
+    for t in trades:
+        vr = t.get("vol_ratio_at_entry")
+        if vr is None:
+            continue
+        if vr < 1.5:        b = "1.0-1.5x"
+        elif vr < 2.0:      b = "1.5-2.0x"
+        elif vr < 3.0:      b = "2.0-3.0x"
+        else:               b = "3.0x+"
+        vol_buckets[b].append(t)
+
+    findings["by_vol_bucket"] = _bucket_summary(vol_buckets)
+
+    # ── VWAP deviation at entry buckets ───────────────────────────────────────
+    vwap_buckets: Dict[str, List] = defaultdict(list)
+    for t in trades:
+        vd = t.get("vwap_dev_at_entry")
+        if vd is None:
+            continue
+        vd_abs = abs(vd)
+        if vd_abs < 0.5:        b = "<0.5%"
+        elif vd_abs < 1.0:      b = "0.5-1.0%"
+        elif vd_abs < 1.5:      b = "1.0-1.5%"
+        elif vd_abs < 2.0:      b = "1.5-2.0%"
+        else:                   b = "2.0%+"
+        vwap_buckets[b].append(t)
+
+    findings["by_vwap_bucket"] = _bucket_summary(vwap_buckets)
 
     # ── Worst sessions (candidates for blocking) ──────────────────────────────
     bad_sessions = [
@@ -211,6 +315,8 @@ def analyse() -> Dict:
 def suggest_tuning(findings: Dict) -> Dict:
     """
     Given analysis findings, suggest parameter adjustments.
+    Uses bucket optima for direct threshold setting where data is sufficient,
+    falls back to ±step nudge based on tag win rates.
     Only suggests changes within PARAM_BOUNDS.
     Returns dict of {param_key: new_value}.
     """
@@ -221,54 +327,104 @@ def suggest_tuning(findings: Dict) -> Dict:
 
     overall_wr = findings.get("overall_win_rate", 50)
 
-    # ── RSI threshold tuning ──────────────────────────────────────────────────
-    # If win rate is low and bb_short tag is underperforming → tighten RSI
-    bb_short_stats = findings.get("by_entry_tag", {}).get("bb_short", {})
-    if bb_short_stats.get("count", 0) >= 5:
-        wr = bb_short_stats["win_rate"]
-        cur_rsi_short = db.get_param_float("rsi_short_entry", 68)
-        lo, hi = PARAM_BOUNDS["rsi_short_entry"]
-        step   = STEP["rsi_short_entry"]
-        if wr < 40 and cur_rsi_short < hi:
-            new_val = min(cur_rsi_short + step, hi)
-            suggestions["rsi_short_entry"] = new_val
-            log.info(f"[Hermes] bb_short win rate {wr:.1f}% → tighten rsi_short_entry: "
-                     f"{cur_rsi_short} → {new_val}")
-        elif wr > 65 and cur_rsi_short > lo:
-            new_val = max(cur_rsi_short - step, lo)
-            suggestions["rsi_short_entry"] = new_val
-            log.info(f"[Hermes] bb_short win rate {wr:.1f}% → relax rsi_short_entry: "
-                     f"{cur_rsi_short} → {new_val}")
+    # ── RSI short entry threshold ─────────────────────────────────────────────
+    rsi_short_buckets = findings.get("by_rsi_short_bucket", {})
+    if rsi_short_buckets:
+        optimal = _best_bucket(rsi_short_buckets, RSI_SHORT_BUCKET_VALUES)
+        if optimal is not None:
+            cur = db.get_param_float("rsi_short_entry", 68)
+            lo, hi = PARAM_BOUNDS["rsi_short_entry"]
+            clamped = max(lo, min(hi, optimal))
+            if abs(clamped - cur) >= STEP["rsi_short_entry"]:
+                suggestions["rsi_short_entry"] = round(clamped, 1)
+                log.info(f"[Hermes] RSI short bucket optimal {optimal} → "
+                         f"rsi_short_entry: {cur} → {round(clamped, 1)}")
+    else:
+        # Fallback: nudge based on bb_short tag win rate
+        bb_short_stats = findings.get("by_entry_tag", {}).get("bb_short", {})
+        if bb_short_stats.get("count", 0) >= 5:
+            wr = bb_short_stats["win_rate"]
+            cur = db.get_param_float("rsi_short_entry", 68)
+            lo, hi = PARAM_BOUNDS["rsi_short_entry"]
+            step   = STEP["rsi_short_entry"]
+            if wr < 40 and cur < hi:
+                new_val = min(cur + step, hi)
+                suggestions["rsi_short_entry"] = new_val
+                log.info(f"[Hermes] bb_short WR {wr:.1f}% → tighten rsi_short_entry: "
+                         f"{cur} → {new_val}")
+            elif wr > 65 and cur > lo:
+                new_val = max(cur - step, lo)
+                suggestions["rsi_short_entry"] = new_val
+                log.info(f"[Hermes] bb_short WR {wr:.1f}% → relax rsi_short_entry: "
+                         f"{cur} → {new_val}")
 
-    bb_long_stats = findings.get("by_entry_tag", {}).get("bb_long", {})
-    if bb_long_stats.get("count", 0) >= 5:
-        wr = bb_long_stats["win_rate"]
-        cur_rsi_long = db.get_param_float("rsi_long_entry", 32)
-        lo, hi = PARAM_BOUNDS["rsi_long_entry"]
-        step   = STEP["rsi_long_entry"]
-        if wr < 40 and cur_rsi_long > lo:
-            new_val = max(cur_rsi_long - step, lo)
-            suggestions["rsi_long_entry"] = new_val
-            log.info(f"[Hermes] bb_long win rate {wr:.1f}% → tighten rsi_long_entry: "
-                     f"{cur_rsi_long} → {new_val}")
-        elif wr > 65 and cur_rsi_long < hi:
-            new_val = min(cur_rsi_long + step, hi)
-            suggestions["rsi_long_entry"] = new_val
-            log.info(f"[Hermes] bb_long win rate {wr:.1f}% → relax rsi_long_entry: "
-                     f"{cur_rsi_long} → {new_val}")
+    # ── RSI long entry threshold ──────────────────────────────────────────────
+    rsi_long_buckets = findings.get("by_rsi_long_bucket", {})
+    if rsi_long_buckets:
+        optimal = _best_bucket(rsi_long_buckets, RSI_LONG_BUCKET_VALUES)
+        if optimal is not None:
+            cur = db.get_param_float("rsi_long_entry", 32)
+            lo, hi = PARAM_BOUNDS["rsi_long_entry"]
+            clamped = max(lo, min(hi, optimal))
+            if abs(clamped - cur) >= STEP["rsi_long_entry"]:
+                suggestions["rsi_long_entry"] = round(clamped, 1)
+                log.info(f"[Hermes] RSI long bucket optimal {optimal} → "
+                         f"rsi_long_entry: {cur} → {round(clamped, 1)}")
+    else:
+        # Fallback: nudge based on bb_long tag win rate
+        bb_long_stats = findings.get("by_entry_tag", {}).get("bb_long", {})
+        if bb_long_stats.get("count", 0) >= 5:
+            wr = bb_long_stats["win_rate"]
+            cur = db.get_param_float("rsi_long_entry", 32)
+            lo, hi = PARAM_BOUNDS["rsi_long_entry"]
+            step   = STEP["rsi_long_entry"]
+            if wr < 40 and cur > lo:
+                new_val = max(cur - step, lo)
+                suggestions["rsi_long_entry"] = new_val
+                log.info(f"[Hermes] bb_long WR {wr:.1f}% → tighten rsi_long_entry: "
+                         f"{cur} → {new_val}")
+            elif wr > 65 and cur < hi:
+                new_val = min(cur + step, hi)
+                suggestions["rsi_long_entry"] = new_val
+                log.info(f"[Hermes] bb_long WR {wr:.1f}% → relax rsi_long_entry: "
+                         f"{cur} → {new_val}")
 
-    # ── Volume multiplier tuning ──────────────────────────────────────────────
-    # If too many losing trades → raise volume bar
-    cur_vol = db.get_param_float("volume_multiplier", 1.2)
-    lo, hi  = PARAM_BOUNDS["volume_multiplier"]
-    step    = STEP["volume_multiplier"]
-    if overall_wr < 40 and cur_vol < hi:
-        new_val = min(cur_vol + step, hi)
-        suggestions["volume_multiplier"] = new_val
-        log.info(f"[Hermes] Overall WR {overall_wr:.1f}% → raise volume_multiplier: "
-                 f"{cur_vol} → {new_val}")
+    # ── Volume multiplier ─────────────────────────────────────────────────────
+    vol_buckets = findings.get("by_vol_bucket", {})
+    if vol_buckets:
+        optimal = _best_bucket(vol_buckets, VOL_BUCKET_VALUES)
+        if optimal is not None:
+            cur = db.get_param_float("volume_multiplier", 1.2)
+            lo, hi = PARAM_BOUNDS["volume_multiplier"]
+            clamped = max(lo, min(hi, optimal))
+            if abs(clamped - cur) >= STEP["volume_multiplier"]:
+                suggestions["volume_multiplier"] = round(clamped, 2)
+                log.info(f"[Hermes] Vol bucket optimal {optimal} → "
+                         f"volume_multiplier: {cur} → {round(clamped, 2)}")
+    else:
+        # Fallback: raise bar if overall WR is poor
+        cur = db.get_param_float("volume_multiplier", 1.2)
+        lo, hi = PARAM_BOUNDS["volume_multiplier"]
+        if overall_wr < 40 and cur < hi:
+            new_val = min(cur + STEP["volume_multiplier"], hi)
+            suggestions["volume_multiplier"] = new_val
+            log.info(f"[Hermes] Overall WR {overall_wr:.1f}% → raise volume_multiplier: "
+                     f"{cur} → {new_val}")
 
-    # ── ATR tuning ────────────────────────────────────────────────────────────
+    # ── VWAP dev min ──────────────────────────────────────────────────────────
+    vwap_buckets = findings.get("by_vwap_bucket", {})
+    if vwap_buckets:
+        optimal = _best_bucket(vwap_buckets, VWAP_BUCKET_VALUES)
+        if optimal is not None:
+            cur = db.get_param_float("vwap_dev_min", 0.5)
+            lo, hi = PARAM_BOUNDS["vwap_dev_min"]
+            clamped = max(lo, min(hi, optimal))
+            if abs(clamped - cur) >= STEP["vwap_dev_min"]:
+                suggestions["vwap_dev_min"] = round(clamped, 2)
+                log.info(f"[Hermes] VWAP bucket optimal {optimal} → "
+                         f"vwap_dev_min: {cur} → {round(clamped, 2)}")
+
+    # ── ATR tuning (nudge-based — no clear representative value per bucket) ───
     atr_buckets = findings.get("by_atr_bucket", {})
     # If "very_low" ATR trades are losing → raise atr_min
     very_low = atr_buckets.get("very_low", {})
@@ -278,7 +434,7 @@ def suggest_tuning(findings: Dict) -> Dict:
         if cur < hi:
             new_val = min(cur + STEP["atr_min_pct"], hi)
             suggestions["atr_min_pct"] = new_val
-            log.info(f"[Hermes] very_low ATR win rate {very_low['win_rate']:.1f}% "
+            log.info(f"[Hermes] very_low ATR WR {very_low['win_rate']:.1f}% "
                      f"→ raise atr_min_pct: {cur} → {new_val}")
 
     # If "very_high" ATR trades are losing → lower atr_max
@@ -289,7 +445,7 @@ def suggest_tuning(findings: Dict) -> Dict:
         if cur > lo:
             new_val = max(cur - STEP["atr_max_pct"], lo)
             suggestions["atr_max_pct"] = new_val
-            log.info(f"[Hermes] very_high ATR win rate {very_high['win_rate']:.1f}% "
+            log.info(f"[Hermes] very_high ATR WR {very_high['win_rate']:.1f}% "
                      f"→ lower atr_max_pct: {cur} → {new_val}")
 
     # ── Session blocking ──────────────────────────────────────────────────────
@@ -324,9 +480,27 @@ def run_once():
 
         if findings.get("by_session"):
             for s, stats in findings["by_session"].items():
-                log.info(f"[Hermes]   {s}: {stats['count']} trades | "
+                log.info(f"[Hermes]   session={s}: {stats['count']} trades | "
                          f"WR={stats['win_rate']:.1f}% | "
                          f"avg={stats['avg_profit']:+.2f} USDT")
+
+        # Log best bucket per indicator
+        for label, bucket_key, bucket_values in [
+            ("RSI short", "by_rsi_short_bucket", RSI_SHORT_BUCKET_VALUES),
+            ("RSI long",  "by_rsi_long_bucket",  RSI_LONG_BUCKET_VALUES),
+            ("Vol ratio", "by_vol_bucket",        VOL_BUCKET_VALUES),
+            ("VWAP dev",  "by_vwap_bucket",       VWAP_BUCKET_VALUES),
+        ]:
+            bkt = findings.get(bucket_key, {})
+            if bkt:
+                best = max(
+                    ((b, s) for b, s in bkt.items() if s["count"] >= MIN_BUCKET_TRADES),
+                    key=lambda x: x[1]["win_rate"],
+                    default=None,
+                )
+                if best:
+                    log.info(f"[Hermes]   {label} best bucket: '{best[0]}' "
+                             f"WR={best[1]['win_rate']:.1f}% ({best[1]['count']} trades)")
 
         auto_apply = db.get_param("hermes_auto_apply", "false").lower() == "true"
         db.log_hermes(findings, suggestions, applied=bool(suggestions and auto_apply))
@@ -336,7 +510,8 @@ def run_once():
             apply_suggestions(suggestions)
             tg.hermes_tuned(suggestions)
         elif suggestions:
-            log.info(f"[Hermes] {len(suggestions)} suggestion(s) recorded for review; auto-apply disabled.")
+            log.info(f"[Hermes] {len(suggestions)} suggestion(s) recorded for review; "
+                     "auto-apply disabled.")
         else:
             log.info("[Hermes] No parameter changes needed.")
 

@@ -1,0 +1,56 @@
+services:
+
+  bot:
+    build: ./kotipoti
+    image: kotipotibot_claude_v2
+    container_name: kotipotibot_claude_bot
+    restart: unless-stopped
+    volumes:
+      - kotipoti_claude_data:/data
+    env_file:
+      - .env
+    environment:
+      DRY_RUN: "${DRY_RUN:-true}"          # Keep true unless you have reviewed live-mode safeguards
+      DB_PATH: "/data/kotipoti.db"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      DRY_RUN_WALLET: "${DRY_RUN_WALLET:-5000}"
+      STAKE_USDT: "${STAKE_USDT:-500}"
+      CANDLES_NEEDED: "${CANDLES_NEEDED:-200}"
+      CANDLES_15M: "${CANDLES_15M:-150}"
+      CANDLES_1H: "${CANDLES_1H:-150}"
+      CANDLES_4H: "${CANDLES_4H:-120}"
+      TAKER_FEE_BPS: "${TAKER_FEE_BPS:-5.5}"
+      SLIPPAGE_BPS: "${SLIPPAGE_BPS:-2.0}"
+      TELEGRAM_TOKEN:   "${TELEGRAM_TOKEN:-}"     # set in .env
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"   # set in .env
+    command: python main.py
+    networks:
+      - kotipoti_claude_net
+
+  dashboard:
+    build: ./kotipoti
+    image: kotipotibot_claude_v2
+    container_name: kotipotibot_claude_dashboard
+    restart: unless-stopped
+    volumes:
+      - kotipoti_claude_data:/data      # needs write access for SQLite WAL mode
+    ports:
+      - "${CLAUDE_DASHBOARD_HOST_PORT:-5002}:5000"
+    env_file:
+      - .env
+    environment:
+      DB_PATH: "/data/kotipoti.db"
+      DASHBOARD_PORT: "5000"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-CHANGE_ME}"   # override in .env
+    command: python dashboard.py
+    depends_on:
+      - bot
+    networks:
+      - kotipoti_claude_net
+
+networks:
+  kotipoti_claude_net:
+    driver: bridge
+
+volumes:
+  kotipoti_claude_data:   # Shared SQLite DB between KotipotiBot-Claude bot and dashboard

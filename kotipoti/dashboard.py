@@ -267,7 +267,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>KotipotiBot v2</title>
+<title>KotipotiBot - Codex</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
@@ -477,7 +477,7 @@ function buildUI() {
   wrap.appendChild(el('div',{class:'header'},
     el('div',{},
       el('h1',{},'🤖 KotipotiBot v2'),
-      el('p',{class:'subtitle'},'Kotipoti Trading Bot - Claude - ByBit Futures - 5m')
+      el('p',{class:'subtitle'},'Kotipoti Trading Bot - Codex - ByBit Futures - 5m')
     ),
     el('div',{class:'header-right'},
       el('div',{class:'badge',style:'background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);color:#10B981'},

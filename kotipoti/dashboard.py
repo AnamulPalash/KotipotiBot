@@ -1326,12 +1326,12 @@ function buildAdmin() {
     'Edit values below then click Save. Hermes records suggestions; auto-apply is disabled unless explicitly enabled.'));
 
   const paramGroups = {
-    'Signal Thresholds': ['signal_profile','confirmation_mode','rsi_short_entry','rsi_long_entry','vwap_rsi_short','vwap_rsi_long','trend_rsi_long','trend_rsi_short','trend_rsi_max_long','trend_rsi_min_short','active_min_volume_ratio','rsi_exit_short','rsi_exit_long','volume_multiplier','vwap_dev_min'],
+    'Signal Thresholds': ['signal_profile','confirmation_mode','rsi_short_entry','rsi_long_entry','vwap_rsi_short','vwap_rsi_long','trend_rsi_long','trend_rsi_short','trend_rsi_max_long','trend_rsi_min_short','active_min_volume_ratio','rsi_exit_short','rsi_exit_long','volume_multiplier','vwap_dev_min','min_signal_confidence','min_setup_trades','min_setup_win_rate'],
     'Bollinger / EMA':   ['bb_period','bb_std','ema_fast','ema_slow'],
     'ATR Filter':        ['atr_period','atr_min_pct','atr_max_pct'],
-    'Risk / Position':   ['wallet_start','stake_usdt','stoploss_pct','trailing_pct','trailing_offset','leverage','max_open_trades'],
+    'Risk / Position':   ['wallet_start','stake_usdt','max_risk_per_trade_pct','stoploss_pct','trailing_pct','trailing_offset','max_trade_duration_min','time_stop_min_profit_pct','leverage','max_open_trades'],
     'Comparison / Costs': ['bot_variant','taker_fee_bps','slippage_bps'],
-    'Circuit Breakers':  ['daily_loss_limit','max_consec_losses','pair_cooldown_min','blocked_sessions','hermes_auto_apply'],
+    'Circuit Breakers':  ['daily_loss_limit','max_consec_losses','pair_cooldown_min','max_trades_per_pair_per_day','max_trades_per_day','blocked_sessions','hermes_auto_apply'],
   };
 
   for (const [groupName, keys] of Object.entries(paramGroups)) {

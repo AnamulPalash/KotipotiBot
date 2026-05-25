@@ -188,33 +188,38 @@ def init_db():
 
     # Seed default params if not present
     defaults = {
-        "rsi_short_entry":    "68",
-        "rsi_long_entry":     "32",
+        "signal_profile":     os.environ.get("SIGNAL_PROFILE", "active_dry_run"),
+        "confirmation_mode":  "soft",
+        "rsi_short_entry":    "64",
+        "rsi_long_entry":     "36",
+        "vwap_rsi_short":     "55",
+        "vwap_rsi_long":      "45",
         "rsi_exit_short":     "45",
         "rsi_exit_long":      "55",
         "bb_period":          "20",
         "bb_std":             "2.0",
         "ema_fast":           "8",
         "ema_slow":           "21",
-        "volume_multiplier":  "1.2",
+        "volume_multiplier":  "0.8",
         "atr_period":         "14",
-        "atr_min_pct":        "0.3",   # block if ATR% < this (too quiet)
-        "atr_max_pct":        "3.0",   # block if ATR% > this (too wild)
-        "vwap_dev_min":       "0.5",   # min % deviation for VWAP signal
+        "atr_min_pct":        "0.1",   # block if ATR% < this (too quiet)
+        "atr_max_pct":        "6.0",   # block if ATR% > this (too wild)
+        "vwap_dev_min":       "0.25",  # min % deviation for VWAP signal
         "stoploss_pct":       "2.5",
         "trailing_pct":       "1.0",
         "trailing_offset":    "1.5",
         "leverage":           "5",
         "max_open_trades":    "3",
-        "stake_usdt":         "200",
+        "stake_usdt":         os.environ.get("STAKE_USDT", "500"),
         "daily_loss_limit":   "10.0",  # % of wallet
         "max_consec_losses":  "4",
         "pair_cooldown_min":  "15",
         "blocked_sessions":   "[]",    # JSON list e.g. '["Asia"]'
         "hermes_auto_apply":   "false", # require review before Hermes changes params
-        "bot_variant":         os.environ.get("BOT_VARIANT", "codex_v1"),
+        "bot_variant":         os.environ.get("BOT_VARIANT", "codex_v2_active"),
         "taker_fee_bps":       os.environ.get("TAKER_FEE_BPS", "5.5"),
         "slippage_bps":        os.environ.get("SLIPPAGE_BPS", "2.0"),
+        "wallet_start":        os.environ.get("DRY_RUN_WALLET", "5000"),
     }
     with _conn() as conn:
         now = _now()
@@ -222,6 +227,36 @@ def init_db():
             conn.execute(
                 "INSERT OR IGNORE INTO params(key, value, updated_at) VALUES (?,?,?)",
                 (k, v, now)
+            )
+
+        dry_run = os.environ.get("DRY_RUN", "true").lower() != "false"
+        apply_active = os.environ.get("APPLY_ACTIVE_DRY_RUN_PROFILE", "true").lower() != "false"
+        profile_done = conn.execute(
+            "SELECT value FROM bot_state WHERE key='migration_active_dry_run_profile_v1'"
+        ).fetchone()
+        if dry_run and apply_active and profile_done is None:
+            active_updates = {
+                "signal_profile": "active_dry_run",
+                "confirmation_mode": "soft",
+                "rsi_short_entry": "64",
+                "rsi_long_entry": "36",
+                "vwap_rsi_short": "55",
+                "vwap_rsi_long": "45",
+                "volume_multiplier": "0.8",
+                "atr_min_pct": "0.1",
+                "atr_max_pct": "6.0",
+                "vwap_dev_min": "0.25",
+                "stake_usdt": os.environ.get("STAKE_USDT", "500"),
+                "wallet_start": os.environ.get("DRY_RUN_WALLET", "5000"),
+            }
+            for k, v in active_updates.items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO params(key, value, updated_at, updated_by) VALUES (?,?,?,?)",
+                    (k, v, now, "migration")
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO bot_state(key, value) VALUES (?,?)",
+                ("migration_active_dry_run_profile_v1", now)
             )
 
 
@@ -254,8 +289,12 @@ def get_all_params() -> Dict[str, str]:
 
 
 PARAM_SCHEMA = {
+    "signal_profile":     {"type": "choice", "allowed": {"balanced", "active_dry_run"}},
+    "confirmation_mode":  {"type": "choice", "allowed": {"hard", "soft"}},
     "rsi_short_entry":    {"type": float, "min": 50, "max": 90},
     "rsi_long_entry":     {"type": float, "min": 10, "max": 50},
+    "vwap_rsi_short":     {"type": float, "min": 45, "max": 90},
+    "vwap_rsi_long":      {"type": float, "min": 10, "max": 55},
     "rsi_exit_short":     {"type": float, "min": 10, "max": 80},
     "rsi_exit_long":      {"type": float, "min": 20, "max": 90},
     "bb_period":          {"type": int,   "min": 5,  "max": 100},
@@ -273,6 +312,7 @@ PARAM_SCHEMA = {
     "leverage":           {"type": int,   "min": 1,  "max": 10},
     "max_open_trades":    {"type": int,   "min": 1,  "max": len(DEFAULT_PAIRS)},
     "stake_usdt":         {"type": float, "min": 1.0, "max": 100000.0},
+    "wallet_start":       {"type": float, "min": 1.0, "max": 100000000.0},
     "daily_loss_limit":   {"type": float, "min": 0.1, "max": 100.0},
     "max_consec_losses":  {"type": int,   "min": 1,  "max": 50},
     "pair_cooldown_min":  {"type": int,   "min": 0,  "max": 1440},
@@ -314,6 +354,12 @@ def validate_param_update(key: str, value) -> str:
         if len(sval) > spec.get("max_len", 255):
             raise ValueError(f"{key} is too long")
         return sval
+    if typ == "choice":
+        sval = str(value).strip()
+        allowed = spec.get("allowed", set())
+        if sval not in allowed:
+            raise ValueError(f"{key} must be one of {sorted(allowed)}")
+        return sval
 
     try:
         parsed = typ(value)
@@ -337,7 +383,7 @@ def open_trade(pair, side, entry_price, amount, stake_usdt, leverage,
                pair_regime=None, exchange_order_id=None, stop_order_id=None,
                bot_variant=None) -> int:
     if bot_variant is None:
-        bot_variant = get_param("bot_variant", os.environ.get("BOT_VARIANT", "codex_v1"))
+        bot_variant = get_param("bot_variant", os.environ.get("BOT_VARIANT", "codex_v2_active"))
     with _conn() as conn:
         cur = conn.execute("""
             INSERT INTO trades
@@ -468,7 +514,7 @@ def log_decision(pair: str, candle_ts: str = None, price=None, rsi=None,
                  params_snapshot: dict = None, context: dict = None,
                  bot_variant=None):
     if bot_variant is None:
-        bot_variant = get_param("bot_variant", os.environ.get("BOT_VARIANT", "codex_v1"))
+        bot_variant = get_param("bot_variant", os.environ.get("BOT_VARIANT", "codex_v2_active"))
     with _conn() as conn:
         conn.execute("""
             INSERT INTO decisions

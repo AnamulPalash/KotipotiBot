@@ -54,7 +54,8 @@ log = logging.getLogger("kotipoti")
 DRY_RUN   = os.environ.get("DRY_RUN", "true").lower() != "false"
 API_KEY   = os.environ.get("BYBIT_API_KEY", "")
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
-BOT_VARIANT = os.environ.get("BOT_VARIANT", "codex_v1")
+BOT_VARIANT = os.environ.get("BOT_VARIANT", "codex_v2_active")
+DRY_RUN_WALLET = float(os.environ.get("DRY_RUN_WALLET", "5000"))
 
 PAIRS = db.DEFAULT_PAIRS
 ALT_PAIRS = {"ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT", "XRP/USDT:USDT"}
@@ -321,6 +322,87 @@ def log_decision_snapshot(pair: str, df: pd.DataFrame, p: Dict[str, str],
     )
 
 
+def diagnose_no_signal(pair: str, df5m: pd.DataFrame, p: Dict[str, str],
+                       btc_regime_label: str, pair_regime_label: str,
+                       pair_15m_regime_label: str,
+                       pair_4h_regime_label: str) -> Tuple[str, Dict]:
+    """Explain which gates kept the latest candle out of a trade."""
+    row = df5m.iloc[-1]
+    close = float(row.get("close", 0) or 0)
+    rsi = float(row.get("rsi", 0) or 0)
+    bb_upper = float(row.get("bb_upper", 0) or 0)
+    bb_lower = float(row.get("bb_lower", 0) or 0)
+    atr_pct = float(row.get("atr_pct", 0) or 0)
+    vwap_dev = float(row.get("vwap_dev", 0) or 0)
+    vol_ratio = float(row.get("volume_ratio", 0) or 0)
+
+    rsi_short = float(p.get("rsi_short_entry", "64"))
+    rsi_long = float(p.get("rsi_long_entry", "36"))
+    vwap_rsi_short = float(p.get("vwap_rsi_short", "55"))
+    vwap_rsi_long = float(p.get("vwap_rsi_long", "45"))
+    vol_mult = float(p.get("volume_multiplier", "0.8"))
+    atr_min = float(p.get("atr_min_pct", "0.1"))
+    atr_max = float(p.get("atr_max_pct", "6.0"))
+    vwap_min = float(p.get("vwap_dev_min", "0.25"))
+
+    reasons = []
+    candidates = []
+    if atr_pct < atr_min:
+        reasons.append("atr_too_low")
+    elif atr_pct > atr_max:
+        reasons.append("atr_too_high")
+
+    if vol_ratio < vol_mult:
+        reasons.append("volume_low")
+
+    if bb_upper and close > bb_upper:
+        candidates.append("bb_short")
+        if rsi <= rsi_short:
+            reasons.append("bb_short_rsi_not_high_enough")
+    elif bb_lower and close < bb_lower:
+        candidates.append("bb_long")
+        if rsi >= rsi_long:
+            reasons.append("bb_long_rsi_not_low_enough")
+    else:
+        reasons.append("inside_bollinger_bands")
+
+    if vwap_dev > vwap_min:
+        candidates.append("vwap_short")
+        if rsi <= vwap_rsi_short:
+            reasons.append("vwap_short_rsi_not_high_enough")
+    elif vwap_dev < -vwap_min:
+        candidates.append("vwap_long")
+        if rsi >= vwap_rsi_long:
+            reasons.append("vwap_long_rsi_not_low_enough")
+    else:
+        reasons.append("vwap_deviation_too_small")
+
+    if pair in ALT_PAIRS and btc_regime_label in {"bull", "bear"}:
+        reasons.append(f"btc_{btc_regime_label}_context")
+    if pair_regime_label in {"bull", "bear"}:
+        reasons.append(f"pair_1h_{pair_regime_label}_context")
+    if pair_15m_regime_label == pair_4h_regime_label and pair_15m_regime_label in {"bull", "bear"}:
+        reasons.append(f"multi_tf_{pair_15m_regime_label}_context")
+
+    unique_reasons = list(dict.fromkeys(reasons)) or ["thresholds_not_met"]
+    context = {
+        "profile": p.get("signal_profile", "active_dry_run"),
+        "confirmation_mode": p.get("confirmation_mode", "soft"),
+        "candidate_setups": candidates,
+        "thresholds": {
+            "rsi_short_entry": rsi_short,
+            "rsi_long_entry": rsi_long,
+            "vwap_rsi_short": vwap_rsi_short,
+            "vwap_rsi_long": vwap_rsi_long,
+            "volume_multiplier": vol_mult,
+            "atr_min_pct": atr_min,
+            "atr_max_pct": atr_max,
+            "vwap_dev_min": vwap_min,
+        },
+    }
+    return ",".join(unique_reasons[:5]), context
+
+
 # ── Signal evaluation ─────────────────────────────────────────────────────────
 
 def evaluate_signals(pair: str, df5m: pd.DataFrame,
@@ -355,12 +437,17 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     atr_pct       = row.get("atr_pct", 1.0)
     vwap_dev      = row.get("vwap_dev", 0)
 
-    rsi_short     = float(p.get("rsi_short_entry", "68"))
-    rsi_long      = float(p.get("rsi_long_entry",  "32"))
-    vol_mult      = float(p.get("volume_multiplier", "1.2"))
-    atr_min       = float(p.get("atr_min_pct", "0.3"))
-    atr_max       = float(p.get("atr_max_pct", "3.0"))
-    vwap_min      = float(p.get("vwap_dev_min", "0.5"))
+    rsi_short     = float(p.get("rsi_short_entry", "64"))
+    rsi_long      = float(p.get("rsi_long_entry",  "36"))
+    vol_mult      = float(p.get("volume_multiplier", "0.8"))
+    atr_min       = float(p.get("atr_min_pct", "0.1"))
+    atr_max       = float(p.get("atr_max_pct", "6.0"))
+    vwap_min      = float(p.get("vwap_dev_min", "0.25"))
+    vwap_rsi_short = float(p.get("vwap_rsi_short", "55"))
+    vwap_rsi_long  = float(p.get("vwap_rsi_long", "45"))
+    signal_profile = p.get("signal_profile", "active_dry_run")
+    confirmation_mode = p.get("confirmation_mode", "soft")
+    soft_confirm = signal_profile == "active_dry_run" or confirmation_mode == "soft"
 
     if rsi is None or bb_upper is None:
         return []
@@ -390,10 +477,11 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     if bb_short_ok and rsi_short_ok and vol_ok:
         overextended = rsi > 80
         trend_ok = not (pair_regime_label == "bull" and not overextended)
-        confirm_ok = not (
+        raw_confirm_ok = not (
             pair_15m_regime_label == "bull" and pair_4h_regime_label == "bull"
             and not overextended
         )
+        confirm_ok = raw_confirm_ok or soft_confirm
         btc_ok = True
         if pair in ALT_PAIRS:
             btc_ok = not (btc_regime_label == "bull" and not overextended)
@@ -408,6 +496,7 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
                 "bb_pct": round(bb_pct, 3), "ema_gap": round(ema_gap, 4),
                 "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
                 "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                "confirmation_softened": not raw_confirm_ok and soft_confirm,
             })
         else:
             reason = "trend_filter" if not trend_ok else "confirmation_filter" if not confirm_ok else "btc_filter"
@@ -427,10 +516,11 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     if bb_long_ok and rsi_long_ok and vol_ok:
         overextended = rsi < 20
         trend_ok = not (pair_regime_label == "bear" and not overextended)
-        confirm_ok = not (
+        raw_confirm_ok = not (
             pair_15m_regime_label == "bear" and pair_4h_regime_label == "bear"
             and not overextended
         )
+        confirm_ok = raw_confirm_ok or soft_confirm
         btc_ok = True
         if pair in ALT_PAIRS:
             btc_ok = not (btc_regime_label == "bear" and not overextended)
@@ -445,6 +535,7 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
                 "bb_pct": round(bb_pct, 3), "ema_gap": round(ema_gap, 4),
                 "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
                 "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                "confirmation_softened": not raw_confirm_ok and soft_confirm,
             })
         else:
             reason = "trend_filter" if not trend_ok else "confirmation_filter" if not confirm_ok else "btc_filter"
@@ -459,8 +550,9 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
 
     # ── VWAP reversion SHORT ──────────────────────────────────────────────────
     # vol_mult (not 1.3x) — VWAP signal doesn't need as extreme a volume spike
-    if vwap_dev > vwap_min and vol_ratio >= vol_mult and rsi > 60:
-        trend_ok = pair_regime_label != "bull" and pair_15m_regime_label != "bull"
+    if vwap_dev > vwap_min and vol_ratio >= vol_mult and rsi > vwap_rsi_short:
+        raw_trend_ok = pair_regime_label != "bull" and pair_15m_regime_label != "bull"
+        trend_ok = raw_trend_ok or soft_confirm
         btc_ok   = btc_regime_label != "bull" if pair in ALT_PAIRS else True
         if trend_ok and btc_ok:
             log.info(f"[Signal] ✅ vwap_short {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}")
@@ -471,11 +563,13 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
                 "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
                 "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
                 "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                "confirmation_softened": not raw_trend_ok and soft_confirm,
             })
 
     # ── VWAP reversion LONG ───────────────────────────────────────────────────
-    if vwap_dev < -vwap_min and vol_ratio >= vol_mult and rsi < 40:
-        trend_ok = pair_regime_label != "bear" and pair_15m_regime_label != "bear"
+    if vwap_dev < -vwap_min and vol_ratio >= vol_mult and rsi < vwap_rsi_long:
+        raw_trend_ok = pair_regime_label != "bear" and pair_15m_regime_label != "bear"
+        trend_ok = raw_trend_ok or soft_confirm
         btc_ok   = btc_regime_label != "bear" if pair in ALT_PAIRS else True
         if trend_ok and btc_ok:
             log.info(f"[Signal] ✅ vwap_long {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}")
@@ -486,6 +580,7 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
                 "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
                 "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
                 "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                "confirmation_softened": not raw_trend_ok and soft_confirm,
             })
 
     return signals
@@ -895,7 +990,7 @@ def run():
 
     wallet_start = float(db.get_param("wallet_start", "0") or "0")
     if wallet_start == 0:
-        wallet_start = float(db.get_param("stake_usdt", "200")) * 10
+        wallet_start = DRY_RUN_WALLET
         db.set_param("wallet_start", str(wallet_start))
 
     last_candle_time: Dict[str, str] = {}  # pair -> last processed candle timestamp
@@ -1056,9 +1151,14 @@ def run():
                     sigs = evaluate_signals(pair, df, btc_regime_label, p_regime,
                                             p15_regime, p4_regime, p)
                     if not sigs:
+                        skip_reason, no_signal_context = diagnose_no_signal(
+                            pair, df, p, btc_regime_label, p_regime,
+                            p15_regime, p4_regime
+                        )
                         log_decision_snapshot(
                             pair, df, p, btc_regime_label, p15_regime, p_regime,
-                            p4_regime, "no_signal", False, "no_signal"
+                            p4_regime, "no_signal", False, skip_reason,
+                            no_signal_context
                         )
                     for sig in sigs:
                         if len(open_trades) >= max_open:

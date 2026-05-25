@@ -1133,6 +1133,7 @@ function buildAdmin() {
 
   const riskFields = [
     {key:'stake_usdt',     label:'Stake per trade (USDT)',  hint:'Amount risked per position'},
+    {key:'wallet_start',   label:'Dry-run wallet (USDT)',   hint:'Starting balance used for daily loss limit'},
     {key:'leverage',       label:'Leverage',                hint:'Multiplier (e.g. 5 = 5×)'},
     {key:'max_open_trades',label:'Max open trades',         hint:'How many positions at once'},
     {key:'stoploss_pct',   label:'Stop loss %',             hint:'e.g. 2.5 = 2.5% from entry'},
@@ -1325,10 +1326,10 @@ function buildAdmin() {
     'Edit values below then click Save. Hermes records suggestions; auto-apply is disabled unless explicitly enabled.'));
 
   const paramGroups = {
-    'Signal Thresholds': ['rsi_short_entry','rsi_long_entry','rsi_exit_short','rsi_exit_long','volume_multiplier','vwap_dev_min'],
+    'Signal Thresholds': ['signal_profile','confirmation_mode','rsi_short_entry','rsi_long_entry','vwap_rsi_short','vwap_rsi_long','rsi_exit_short','rsi_exit_long','volume_multiplier','vwap_dev_min'],
     'Bollinger / EMA':   ['bb_period','bb_std','ema_fast','ema_slow'],
     'ATR Filter':        ['atr_period','atr_min_pct','atr_max_pct'],
-    'Risk / Position':   ['stoploss_pct','trailing_pct','trailing_offset','leverage','max_open_trades','stake_usdt'],
+    'Risk / Position':   ['wallet_start','stake_usdt','stoploss_pct','trailing_pct','trailing_offset','leverage','max_open_trades'],
     'Comparison / Costs': ['bot_variant','taker_fee_bps','slippage_bps'],
     'Circuit Breakers':  ['daily_loss_limit','max_consec_losses','pair_cooldown_min','blocked_sessions','hermes_auto_apply'],
   };

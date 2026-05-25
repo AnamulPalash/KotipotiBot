@@ -477,7 +477,7 @@ function buildUI() {
   wrap.appendChild(el('div',{class:'header'},
     el('div',{},
       el('h1',{},'🤖 KotipotiBot v2'),
-      el('p',{class:'subtitle'},'Custom Bot · Bybit Futures · 5m · No Freqtrade')
+      el('p',{class:'subtitle'},'Kotipoti Trading Bot - Claude - ByBit Futures - 5m')
     ),
     el('div',{class:'header-right'},
       el('div',{class:'badge',style:'background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);color:#10B981'},

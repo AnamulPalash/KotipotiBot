@@ -1326,7 +1326,7 @@ function buildAdmin() {
     'Edit values below then click Save. Hermes records suggestions; auto-apply is disabled unless explicitly enabled.'));
 
   const paramGroups = {
-    'Signal Thresholds': ['signal_profile','confirmation_mode','rsi_short_entry','rsi_long_entry','vwap_rsi_short','vwap_rsi_long','rsi_exit_short','rsi_exit_long','volume_multiplier','vwap_dev_min'],
+    'Signal Thresholds': ['signal_profile','confirmation_mode','rsi_short_entry','rsi_long_entry','vwap_rsi_short','vwap_rsi_long','trend_rsi_long','trend_rsi_short','trend_rsi_max_long','trend_rsi_min_short','active_min_volume_ratio','rsi_exit_short','rsi_exit_long','volume_multiplier','vwap_dev_min'],
     'Bollinger / EMA':   ['bb_period','bb_std','ema_fast','ema_slow'],
     'ATR Filter':        ['atr_period','atr_min_pct','atr_max_pct'],
     'Risk / Position':   ['wallet_start','stake_usdt','stoploss_pct','trailing_pct','trailing_offset','leverage','max_open_trades'],

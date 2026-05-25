@@ -340,6 +340,9 @@ def diagnose_no_signal(pair: str, df5m: pd.DataFrame, p: Dict[str, str],
     rsi_long = float(p.get("rsi_long_entry", "36"))
     vwap_rsi_short = float(p.get("vwap_rsi_short", "55"))
     vwap_rsi_long = float(p.get("vwap_rsi_long", "45"))
+    trend_rsi_long = float(p.get("trend_rsi_long", "52"))
+    trend_rsi_short = float(p.get("trend_rsi_short", "48"))
+    active_min_vol = float(p.get("active_min_volume_ratio", "0.05"))
     vol_mult = float(p.get("volume_multiplier", "0.8"))
     atr_min = float(p.get("atr_min_pct", "0.1"))
     atr_max = float(p.get("atr_max_pct", "6.0"))
@@ -352,7 +355,9 @@ def diagnose_no_signal(pair: str, df5m: pd.DataFrame, p: Dict[str, str],
     elif atr_pct > atr_max:
         reasons.append("atr_too_high")
 
-    if vol_ratio < vol_mult:
+    if vol_ratio < active_min_vol:
+        reasons.append("active_volume_floor_low")
+    elif vol_ratio < vol_mult:
         reasons.append("volume_low")
 
     if bb_upper and close > bb_upper:
@@ -384,6 +389,16 @@ def diagnose_no_signal(pair: str, df5m: pd.DataFrame, p: Dict[str, str],
     if pair_15m_regime_label == pair_4h_regime_label and pair_15m_regime_label in {"bull", "bear"}:
         reasons.append(f"multi_tf_{pair_15m_regime_label}_context")
 
+    ema_f = float(row.get("ema_fast", 0) or 0)
+    ema_s = float(row.get("ema_slow", 0) or 0)
+    vwap = float(row.get("vwap", 0) or 0)
+    if ema_f > ema_s and vwap and close >= vwap and rsi >= trend_rsi_long:
+        candidates.append("trend_long")
+    elif ema_f < ema_s and vwap and close <= vwap and rsi <= trend_rsi_short:
+        candidates.append("trend_short")
+    else:
+        reasons.append("trend_alignment_not_ready")
+
     unique_reasons = list(dict.fromkeys(reasons)) or ["thresholds_not_met"]
     context = {
         "profile": p.get("signal_profile", "active_dry_run"),
@@ -398,6 +413,9 @@ def diagnose_no_signal(pair: str, df5m: pd.DataFrame, p: Dict[str, str],
             "atr_min_pct": atr_min,
             "atr_max_pct": atr_max,
             "vwap_dev_min": vwap_min,
+            "trend_rsi_long": trend_rsi_long,
+            "trend_rsi_short": trend_rsi_short,
+            "active_min_volume_ratio": active_min_vol,
         },
     }
     return ",".join(unique_reasons[:5]), context
@@ -445,6 +463,11 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     vwap_min      = float(p.get("vwap_dev_min", "0.25"))
     vwap_rsi_short = float(p.get("vwap_rsi_short", "55"))
     vwap_rsi_long  = float(p.get("vwap_rsi_long", "45"))
+    trend_rsi_long = float(p.get("trend_rsi_long", "52"))
+    trend_rsi_short = float(p.get("trend_rsi_short", "48"))
+    trend_rsi_max_long = float(p.get("trend_rsi_max_long", "68"))
+    trend_rsi_min_short = float(p.get("trend_rsi_min_short", "32"))
+    active_min_vol = float(p.get("active_min_volume_ratio", "0.05"))
     signal_profile = p.get("signal_profile", "active_dry_run")
     confirmation_mode = p.get("confirmation_mode", "soft")
     soft_confirm = signal_profile == "active_dry_run" or confirmation_mode == "soft"
@@ -582,6 +605,47 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
                 "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
                 "confirmation_softened": not raw_trend_ok and soft_confirm,
             })
+
+    # ── Active dry-run trend continuation ─────────────────────────────────────
+    # This gives the comparison bot something to test during calm candles where
+    # price is inside Bollinger Bands and VWAP deviation is small.
+    if signal_profile == "active_dry_run" and not signals and vol_ratio >= active_min_vol:
+        active_long_ok = (
+            ema_f > ema_s and close >= row.get("vwap", close)
+            and trend_rsi_long <= rsi <= trend_rsi_max_long
+        )
+        active_short_ok = (
+            ema_f < ema_s and close <= row.get("vwap", close)
+            and trend_rsi_min_short <= rsi <= trend_rsi_short
+        )
+        if active_long_ok:
+            raw_trend_ok = pair_regime_label != "bear" and pair_15m_regime_label != "bear"
+            btc_ok = btc_regime_label != "bear" if pair in ALT_PAIRS else True
+            if (raw_trend_ok or soft_confirm) and btc_ok:
+                log.info(f"[Signal] ✅ trend_long {pair} rsi={rsi:.1f} ema=bull vol={vol_ratio:.2f}x")
+                signals.append({
+                    "direction": "long", "entry_tag": "trend_long",
+                    "price": close, "rsi": rsi,
+                    "bb_pct": round((bb_lower - close) / bb_lower * 100 if bb_lower else 0, 3),
+                    "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
+                    "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                    "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                    "confirmation_softened": not raw_trend_ok and soft_confirm,
+                })
+        elif active_short_ok:
+            raw_trend_ok = pair_regime_label != "bull" and pair_15m_regime_label != "bull"
+            btc_ok = btc_regime_label != "bull" if pair in ALT_PAIRS else True
+            if (raw_trend_ok or soft_confirm) and btc_ok:
+                log.info(f"[Signal] ✅ trend_short {pair} rsi={rsi:.1f} ema=bear vol={vol_ratio:.2f}x")
+                signals.append({
+                    "direction": "short", "entry_tag": "trend_short",
+                    "price": close, "rsi": rsi,
+                    "bb_pct": round((close - bb_upper) / bb_upper * 100 if bb_upper else 0, 3),
+                    "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
+                    "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                    "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                    "confirmation_softened": not raw_trend_ok and soft_confirm,
+                })
 
     return signals
 

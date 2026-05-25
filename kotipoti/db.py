@@ -190,8 +190,8 @@ def init_db():
     defaults = {
         "signal_profile":     os.environ.get("SIGNAL_PROFILE", "active_dry_run"),
         "confirmation_mode":  "soft",
-        "rsi_short_entry":    "64",
-        "rsi_long_entry":     "36",
+        "rsi_short_entry":    "58",
+        "rsi_long_entry":     "42",
         "vwap_rsi_short":     "55",
         "vwap_rsi_long":      "45",
         "trend_rsi_long":     "52",
@@ -209,7 +209,7 @@ def init_db():
         "atr_period":         "14",
         "atr_min_pct":        "0.1",   # block if ATR% < this (too quiet)
         "atr_max_pct":        "6.0",   # block if ATR% > this (too wild)
-        "vwap_dev_min":       "0.25",  # min % deviation for VWAP signal
+        "vwap_dev_min":       "0.15",  # min % deviation for VWAP signal
         "stoploss_pct":       "2.5",
         "trailing_pct":       "1.0",
         "trailing_offset":    "1.5",
@@ -237,14 +237,14 @@ def init_db():
         dry_run = os.environ.get("DRY_RUN", "true").lower() != "false"
         apply_active = os.environ.get("APPLY_ACTIVE_DRY_RUN_PROFILE", "true").lower() != "false"
         profile_done = conn.execute(
-            "SELECT value FROM bot_state WHERE key='migration_active_dry_run_profile_v1'"
+            "SELECT value FROM bot_state WHERE key='migration_active_dry_run_profile_v2'"
         ).fetchone()
         if dry_run and apply_active and profile_done is None:
             active_updates = {
                 "signal_profile": "active_dry_run",
                 "confirmation_mode": "soft",
-                "rsi_short_entry": "64",
-                "rsi_long_entry": "36",
+                "rsi_short_entry": "58",
+                "rsi_long_entry": "42",
                 "vwap_rsi_short": "55",
                 "vwap_rsi_long": "45",
                 "trend_rsi_long": "52",
@@ -255,7 +255,7 @@ def init_db():
                 "volume_multiplier": "0.8",
                 "atr_min_pct": "0.1",
                 "atr_max_pct": "6.0",
-                "vwap_dev_min": "0.25",
+                "vwap_dev_min": "0.15",
                 "stake_usdt": os.environ.get("STAKE_USDT", "500"),
                 "wallet_start": os.environ.get("DRY_RUN_WALLET", "5000"),
             }
@@ -266,7 +266,7 @@ def init_db():
                 )
             conn.execute(
                 "INSERT OR REPLACE INTO bot_state(key, value) VALUES (?,?)",
-                ("migration_active_dry_run_profile_v1", now)
+                ("migration_active_dry_run_profile_v2", now)
             )
 
 

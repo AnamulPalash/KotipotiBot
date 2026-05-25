@@ -437,6 +437,19 @@ const fmt  = (n,d=2) => n==null?'—':Number(n).toFixed(d);
 const fmtU = n => n==null?'—':(n>=0?'+':'')+Number(n).toFixed(2)+' USDT';
 const fmtP = n => n==null?'—':(n>=0?'+':'')+Number(n).toFixed(2)+'%';
 const cc   = n => n==null?'':n>=0?'g':'r';
+const sydneyTime = d => {
+  if (!d) return '—';
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return '—';
+  return dt.toLocaleString('en-AU', {
+    timeZone:'Australia/Sydney',
+    day:'2-digit',
+    month:'short',
+    hour:'2-digit',
+    minute:'2-digit',
+    hour12:false
+  });
+};
 const holdDur = d => {
   if (!d) return '—';
   const s = Math.floor((Date.now()-new Date(d).getTime())/1000);
@@ -796,7 +809,8 @@ function buildOverview() {
       el('div',{style:`width:6px;height:6px;border-radius:50%;background:${p>=0?'#10B981':'#EF4444'}`}),
       el('div',{},
         el('span',{style:'font-size:13px;font-weight:600;color:#F8FAFC'},t.pair.split('/')[0]),
-        el('span',{style:'font-size:11px;color:#94A3B8;margin-left:6px'},t.exit_reason||'—')
+        el('span',{style:'font-size:11px;color:#94A3B8;margin-left:6px'},t.exit_reason||'—'),
+        el('div',{style:'font-size:10px;color:#64748B;margin-top:2px'},sydneyTime(t.exit_time)+' Sydney')
       )
     ));
     row.appendChild(el('span',{class:cc(p),style:'font-size:13px;font-weight:600'},fmtU(p)));
@@ -848,7 +862,7 @@ function buildOpen() {
   const tbl  = el('table',{});
   tbl.appendChild(el('thead',{},el('tr',{},
     el('th',{class:'left'},'Pair'),el('th',{},'Dir'),el('th',{},'Entry'),
-    el('th',{},'Stake'),el('th',{},'Holding'),el('th',{},'Tag'),el('th',{},'Session')
+    el('th',{},'Opened'),el('th',{},'Stake'),el('th',{},'Holding'),el('th',{},'Tag'),el('th',{},'Session')
   )));
   const tb = el('tbody',{});
   for (const t of state.openTrades) {
@@ -856,6 +870,7 @@ function buildOpen() {
       el('td',{class:'left',html:`<span style="font-weight:700;color:#F8FAFC">${t.pair}</span>`}),
       el('td',{},el('span',{class:t.side==='short'?'dir-short':'dir-long'},t.side.toUpperCase())),
       el('td',{},fmt(t.entry_price,4)),
+      el('td',{style:'color:#94A3B8;font-size:12px'},sydneyTime(t.entry_time)),
       el('td',{},fmt(t.stake_usdt,0)+' USDT'),
       el('td',{},holdDur(t.entry_time)),
       el('td',{},el('span',{class:'tag'},t.entry_tag||'—')),
@@ -879,7 +894,7 @@ function buildClosed() {
   const tbl  = el('table',{});
   tbl.appendChild(el('thead',{},el('tr',{},
     el('th',{class:'left'},'#'),el('th',{class:'left'},'Pair'),el('th',{},'Dir'),
-    el('th',{},'Entry'),el('th',{},'Exit'),el('th',{},'P&L'),
+    el('th',{},'Entry'),el('th',{},'Exit'),el('th',{},'Opened'),el('th',{},'Closed'),el('th',{},'P&L'),
     el('th',{},'Exit Reason'),el('th',{},'Session'),el('th',{},'BTC Regime')
   )));
   const tb = el('tbody',{});
@@ -892,6 +907,8 @@ function buildClosed() {
         t.side==='short'?'S':'L')),
       el('td',{},fmt(t.entry_price,4)),
       el('td',{},fmt(t.exit_price,4)),
+      el('td',{style:'color:#94A3B8;font-size:12px'},sydneyTime(t.entry_time)),
+      el('td',{style:'color:#94A3B8;font-size:12px'},sydneyTime(t.exit_time)),
       el('td',{class:cc(p),style:'font-weight:600'},fmtU(p)),
       el('td',{style:'color:#94A3B8;font-size:12px'},t.exit_reason||'—'),
       el('td',{style:'color:#94A3B8'},t.session||'—'),
@@ -1289,7 +1306,7 @@ function buildAdmin() {
     const tbl = el('table',{});
     tbl.appendChild(el('thead',{},el('tr',{},
       el('th',{class:'left'},'#'),el('th',{class:'left'},'Pair'),el('th',{},'Dir'),
-      el('th',{},'Entry'),el('th',{},'Stake'),el('th',{},'Holding'),el('th',{},'Action')
+      el('th',{},'Entry'),el('th',{},'Opened'),el('th',{},'Stake'),el('th',{},'Holding'),el('th',{},'Action')
     )));
     const tb = el('tbody',{});
     for (const t of state.openTrades) {
@@ -1309,6 +1326,7 @@ function buildAdmin() {
         el('td',{class:'left',style:'font-weight:600'},t.pair),
         el('td',{},el('span',{class:t.side==='short'?'dir-short':'dir-long'},t.side.toUpperCase())),
         el('td',{},fmt(t.entry_price,4)),
+        el('td',{style:'color:#94A3B8;font-size:12px'},sydneyTime(t.entry_time)),
         el('td',{},fmt(t.stake_usdt,0)+' USDT'),
         el('td',{},holdDur(t.entry_time)),
         el('td',{},fc)

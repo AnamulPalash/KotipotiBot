@@ -212,6 +212,130 @@ def compute_indicators(df: pd.DataFrame, p: Optional[Dict[str, str]] = None) -> 
     return df
 
 
+def candle_quality(df: pd.DataFrame, side: str, lookback: int = 5) -> Dict:
+    """
+    Analyse the last `lookback` candles for multi-candle signal quality.
+    Returns a dict with quality flags and a human-readable reason if any fail.
+
+    Checks:
+      - rsi_fresh:      RSI is rising *into* this signal (not already exhausted).
+                        For shorts: RSI now > RSI 2 candles ago (momentum building).
+                        For longs:  RSI now < RSI 2 candles ago.
+      - rsi_not_stale:  RSI hasn't been in the extreme zone for too many candles.
+                        Stale = already overbought/oversold for 4+ consecutive candles.
+      - body_strong:    Candle body is convincing.
+                        Short: close is in the top 70% of the candle's high-low range.
+                        Long:  close is in the bottom 30% (i.e. closed near the low).
+                        Wait — for a LONG we want a bullish close, meaning close near
+                        the HIGH of the candle. So: long close in top 30% of range.
+      - vol_expanding:  Volume on the signal candle >= volume on the previous candle.
+                        Confirms energy behind the move.
+      - rsi_divergence: (bonus, not a hard filter — just a confidence booster)
+                        Short: price made a higher high vs N candles ago but RSI did not
+                               → bearish divergence, stronger short signal.
+                        Long:  price made a lower low vs N candles ago but RSI did not
+                               → bullish divergence, stronger long signal.
+
+    Returns dict:
+      {
+        "rsi_fresh": bool,
+        "rsi_not_stale": bool,
+        "body_strong": bool,
+        "vol_expanding": bool,
+        "divergence": bool,       # bonus flag, not a hard gate
+        "quality_ok": bool,       # True if all hard gates pass
+        "skip_reason": str|None,  # first failing reason, or None
+        "confidence_boost": float # 0.0 or 0.1 if divergence present
+      }
+    """
+    if len(df) < lookback + 2:
+        return {"quality_ok": True, "skip_reason": None,
+                "rsi_fresh": True, "rsi_not_stale": True,
+                "body_strong": True, "vol_expanding": True,
+                "divergence": False, "confidence_boost": 0.0}
+
+    cur   = df.iloc[-1]
+    prev1 = df.iloc[-2]
+    prev2 = df.iloc[-3]
+    window = df.iloc[-(lookback + 1):-1]  # last `lookback` candles before current
+
+    rsi_now   = float(cur.get("rsi",  50) or 50)
+    rsi_prev2 = float(prev2.get("rsi", 50) or 50)
+
+    # ── RSI freshness ─────────────────────────────────────────────────────────
+    if side == "short":
+        rsi_fresh = rsi_now > rsi_prev2          # RSI rising into overbought
+    else:
+        rsi_fresh = rsi_now < rsi_prev2          # RSI falling into oversold
+
+    # ── RSI staleness — already been extreme for too long ────────────────────
+    if side == "short":
+        stale_threshold = 58.0
+        stale_count = sum(1 for _, r in window.iterrows()
+                          if (r.get("rsi") or 0) > stale_threshold)
+    else:
+        stale_threshold = 42.0
+        stale_count = sum(1 for _, r in window.iterrows()
+                          if (r.get("rsi") or 0) < stale_threshold)
+    rsi_not_stale = stale_count < 4   # tolerate up to 3 candles, 4+ = exhausted
+
+    # ── Candle body strength ──────────────────────────────────────────────────
+    candle_range = float(cur["high"]) - float(cur["low"])
+    if candle_range > 0:
+        # Position of close within the high-low range (0 = at low, 1 = at high)
+        close_position = (float(cur["close"]) - float(cur["low"])) / candle_range
+        if side == "short":
+            body_strong = close_position >= 0.60   # closed in upper 40% of range
+        else:
+            body_strong = close_position <= 0.40   # closed in lower 40% of range
+    else:
+        body_strong = True   # doji/flat candle — don't penalise
+
+    # ── Volume expansion ──────────────────────────────────────────────────────
+    vol_cur  = float(cur.get("volume",  0) or 0)
+    vol_prev = float(prev1.get("volume", 0) or 0)
+    vol_expanding = vol_cur >= vol_prev * 0.85   # allow 15% slack — not strict equality
+
+    # ── RSI divergence (bonus) ────────────────────────────────────────────────
+    divergence = False
+    try:
+        lookback_row = df.iloc[-(lookback + 1)]
+        if side == "short":
+            price_hh = float(cur["high"]) > float(lookback_row["high"])
+            rsi_hh   = rsi_now > float(lookback_row.get("rsi") or rsi_now)
+            divergence = price_hh and not rsi_hh   # price new high, RSI didn't confirm
+        else:
+            price_ll = float(cur["low"]) < float(lookback_row["low"])
+            rsi_ll   = rsi_now < float(lookback_row.get("rsi") or rsi_now)
+            divergence = price_ll and not rsi_ll   # price new low, RSI didn't confirm
+    except Exception:
+        divergence = False
+
+    # ── Aggregate ─────────────────────────────────────────────────────────────
+    skip_reason = None
+    if not rsi_fresh:
+        skip_reason = "rsi_not_fresh"
+    elif not rsi_not_stale:
+        skip_reason = "rsi_stale"
+    elif not body_strong:
+        skip_reason = "weak_candle_body"
+    elif not vol_expanding:
+        skip_reason = "volume_not_expanding"
+
+    quality_ok = skip_reason is None
+
+    return {
+        "rsi_fresh":        rsi_fresh,
+        "rsi_not_stale":    rsi_not_stale,
+        "body_strong":      body_strong,
+        "vol_expanding":    vol_expanding,
+        "divergence":       divergence,
+        "quality_ok":       quality_ok,
+        "skip_reason":      skip_reason,
+        "confidence_boost": 0.1 if divergence else 0.0,
+    }
+
+
 def compute_1h_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Add 1h trend indicators: EMA21, RSI, higher-highs, lower-lows."""
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
@@ -462,6 +586,10 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     # ── Volume gate ───────────────────────────────────────────────────────────
     vol_ok = vol_ratio >= vol_mult
 
+    # ── Multi-candle quality (computed once, reused per signal) ──────────────
+    cq_short = candle_quality(df5m, "short")
+    cq_long  = candle_quality(df5m, "long")
+
     # Log current indicator snapshot every candle (INFO so it's always visible)
     log.info(f"[Indicators] {pair} | close={close:.4f} | rsi={rsi:.1f} | "
              f"atr={atr_pct:.2f}% | vwap_dev={vwap_dev:+.2f}% | "
@@ -474,34 +602,44 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     rsi_short_ok = rsi > rsi_short
 
     if bb_short_ok and rsi_short_ok and vol_ok:
-        overextended = rsi > 80
-        trend_ok = not (pair_regime_label == "bull" and not overextended)
-        raw_confirm_ok = not (
-            pair_15m_regime_label == "bull" and pair_4h_regime_label == "bull"
-            and not overextended
-        )
-        confirm_ok = raw_confirm_ok or soft_confirm
-        btc_ok = True
-        if pair in ALT_PAIRS:
-            btc_ok = not (btc_regime_label == "bull" and not overextended)
-
-        if trend_ok and confirm_ok and btc_ok:
-            bb_pct = (close - bb_upper) / bb_upper * 100
-            ema_gap = (ema_f - ema_s) / close * 100
-            log.info(f"[Signal] ✅ bb_short {pair} rsi={rsi:.1f} bb_pct={bb_pct:.2f}% vol={vol_ratio:.2f}x")
-            signals.append({
-                "direction": "short", "entry_tag": "bb_short",
-                "price": close, "rsi": rsi,
-                "bb_pct": round(bb_pct, 3), "ema_gap": round(ema_gap, 4),
-                "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
-                "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
-                "confirmation_softened": not raw_confirm_ok and soft_confirm,
-            })
-        else:
-            reason = "trend_filter" if not trend_ok else "confirmation_filter" if not confirm_ok else "btc_filter"
-            log.info(f"[Signal] ⛔ bb_short {pair} blocked: {reason}")
-            db.log_signal(pair, "short", fired=False, skip_reason=reason,
+        if not cq_short["quality_ok"]:
+            log.info(f"[Signal] ⛔ bb_short {pair} quality filter: {cq_short['skip_reason']} "
+                     f"(rsi_fresh={cq_short['rsi_fresh']} stale={not cq_short['rsi_not_stale']} "
+                     f"body={cq_short['body_strong']} vol_exp={cq_short['vol_expanding']})")
+            db.log_signal(pair, "short", fired=False, skip_reason=cq_short["skip_reason"],
                           price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+        else:
+            overextended = rsi > 80
+            trend_ok = not (pair_regime_label == "bull" and not overextended)
+            raw_confirm_ok = not (
+                pair_15m_regime_label == "bull" and pair_4h_regime_label == "bull"
+                and not overextended
+            )
+            confirm_ok = raw_confirm_ok or soft_confirm
+            btc_ok = True
+            if pair in ALT_PAIRS:
+                btc_ok = not (btc_regime_label == "bull" and not overextended)
+
+            if trend_ok and confirm_ok and btc_ok:
+                bb_pct = (close - bb_upper) / bb_upper * 100
+                ema_gap = (ema_f - ema_s) / close * 100
+                div_tag = " 📉divergence" if cq_short["divergence"] else ""
+                log.info(f"[Signal] ✅ bb_short {pair} rsi={rsi:.1f} bb_pct={bb_pct:.2f}% "
+                         f"vol={vol_ratio:.2f}x{div_tag}")
+                signals.append({
+                    "direction": "short", "entry_tag": "bb_short",
+                    "price": close, "rsi": rsi,
+                    "bb_pct": round(bb_pct, 3), "ema_gap": round(ema_gap, 4),
+                    "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                    "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                    "confirmation_softened": not raw_confirm_ok and soft_confirm,
+                    "divergence": cq_short["divergence"],
+                })
+            else:
+                reason = "trend_filter" if not trend_ok else "confirmation_filter" if not confirm_ok else "btc_filter"
+                log.info(f"[Signal] ⛔ bb_short {pair} blocked: {reason}")
+                db.log_signal(pair, "short", fired=False, skip_reason=reason,
+                              price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
     elif bb_short_ok:
         miss = []
         if not rsi_short_ok: miss.append(f"rsi={rsi:.1f}<{rsi_short}")
@@ -513,34 +651,44 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     rsi_long_ok = rsi < rsi_long
 
     if bb_long_ok and rsi_long_ok and vol_ok:
-        overextended = rsi < 20
-        trend_ok = not (pair_regime_label == "bear" and not overextended)
-        raw_confirm_ok = not (
-            pair_15m_regime_label == "bear" and pair_4h_regime_label == "bear"
-            and not overextended
-        )
-        confirm_ok = raw_confirm_ok or soft_confirm
-        btc_ok = True
-        if pair in ALT_PAIRS:
-            btc_ok = not (btc_regime_label == "bear" and not overextended)
-
-        if trend_ok and confirm_ok and btc_ok:
-            bb_pct = (bb_lower - close) / bb_lower * 100
-            ema_gap = (ema_f - ema_s) / close * 100
-            log.info(f"[Signal] ✅ bb_long {pair} rsi={rsi:.1f} bb_pct={bb_pct:.2f}% vol={vol_ratio:.2f}x")
-            signals.append({
-                "direction": "long", "entry_tag": "bb_long",
-                "price": close, "rsi": rsi,
-                "bb_pct": round(bb_pct, 3), "ema_gap": round(ema_gap, 4),
-                "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
-                "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
-                "confirmation_softened": not raw_confirm_ok and soft_confirm,
-            })
-        else:
-            reason = "trend_filter" if not trend_ok else "confirmation_filter" if not confirm_ok else "btc_filter"
-            log.info(f"[Signal] ⛔ bb_long {pair} blocked: {reason}")
-            db.log_signal(pair, "long", fired=False, skip_reason=reason,
+        if not cq_long["quality_ok"]:
+            log.info(f"[Signal] ⛔ bb_long {pair} quality filter: {cq_long['skip_reason']} "
+                     f"(rsi_fresh={cq_long['rsi_fresh']} stale={not cq_long['rsi_not_stale']} "
+                     f"body={cq_long['body_strong']} vol_exp={cq_long['vol_expanding']})")
+            db.log_signal(pair, "long", fired=False, skip_reason=cq_long["skip_reason"],
                           price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+        else:
+            overextended = rsi < 20
+            trend_ok = not (pair_regime_label == "bear" and not overextended)
+            raw_confirm_ok = not (
+                pair_15m_regime_label == "bear" and pair_4h_regime_label == "bear"
+                and not overextended
+            )
+            confirm_ok = raw_confirm_ok or soft_confirm
+            btc_ok = True
+            if pair in ALT_PAIRS:
+                btc_ok = not (btc_regime_label == "bear" and not overextended)
+
+            if trend_ok and confirm_ok and btc_ok:
+                bb_pct = (bb_lower - close) / bb_lower * 100
+                ema_gap = (ema_f - ema_s) / close * 100
+                div_tag = " 📈divergence" if cq_long["divergence"] else ""
+                log.info(f"[Signal] ✅ bb_long {pair} rsi={rsi:.1f} bb_pct={bb_pct:.2f}% "
+                         f"vol={vol_ratio:.2f}x{div_tag}")
+                signals.append({
+                    "direction": "long", "entry_tag": "bb_long",
+                    "price": close, "rsi": rsi,
+                    "bb_pct": round(bb_pct, 3), "ema_gap": round(ema_gap, 4),
+                    "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                    "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                    "confirmation_softened": not raw_confirm_ok and soft_confirm,
+                    "divergence": cq_long["divergence"],
+                })
+            else:
+                reason = "trend_filter" if not trend_ok else "confirmation_filter" if not confirm_ok else "btc_filter"
+                log.info(f"[Signal] ⛔ bb_long {pair} blocked: {reason}")
+                db.log_signal(pair, "long", fired=False, skip_reason=reason,
+                              price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
     elif bb_long_ok:
         miss = []
         if not rsi_long_ok: miss.append(f"rsi={rsi:.1f}>{rsi_long}")
@@ -550,37 +698,51 @@ def evaluate_signals(pair: str, df5m: pd.DataFrame,
     # ── VWAP reversion SHORT ──────────────────────────────────────────────────
     # vol_mult (not 1.3x) — VWAP signal doesn't need as extreme a volume spike
     if vwap_dev > vwap_min and vol_ratio >= vol_mult and rsi > vwap_rsi_short:
-        raw_trend_ok = pair_regime_label != "bull" and pair_15m_regime_label != "bull"
-        trend_ok = raw_trend_ok or soft_confirm
-        btc_ok   = btc_regime_label != "bull" if pair in ALT_PAIRS else True
-        if trend_ok and btc_ok:
-            log.info(f"[Signal] ✅ vwap_short {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}")
-            signals.append({
-                "direction": "short", "entry_tag": "vwap_short",
-                "price": close, "rsi": rsi,
-                "bb_pct": round((close - bb_upper) / bb_upper * 100 if bb_upper else 0, 3),
-                "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
-                "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
-                "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
-                "confirmation_softened": not raw_trend_ok and soft_confirm,
-            })
+        if not cq_short["quality_ok"]:
+            log.info(f"[Signal] ⛔ vwap_short {pair} quality filter: {cq_short['skip_reason']}")
+            db.log_signal(pair, "short", fired=False, skip_reason=cq_short["skip_reason"],
+                          price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+        else:
+            raw_trend_ok = pair_regime_label != "bull" and pair_15m_regime_label != "bull"
+            trend_ok = raw_trend_ok or soft_confirm
+            btc_ok   = btc_regime_label != "bull" if pair in ALT_PAIRS else True
+            if trend_ok and btc_ok:
+                div_tag = " 📉divergence" if cq_short["divergence"] else ""
+                log.info(f"[Signal] ✅ vwap_short {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}{div_tag}")
+                signals.append({
+                    "direction": "short", "entry_tag": "vwap_short",
+                    "price": close, "rsi": rsi,
+                    "bb_pct": round((close - bb_upper) / bb_upper * 100 if bb_upper else 0, 3),
+                    "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
+                    "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                    "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                    "confirmation_softened": not raw_trend_ok and soft_confirm,
+                    "divergence": cq_short["divergence"],
+                })
 
     # ── VWAP reversion LONG ───────────────────────────────────────────────────
     if vwap_dev < -vwap_min and vol_ratio >= vol_mult and rsi < vwap_rsi_long:
-        raw_trend_ok = pair_regime_label != "bear" and pair_15m_regime_label != "bear"
-        trend_ok = raw_trend_ok or soft_confirm
-        btc_ok   = btc_regime_label != "bear" if pair in ALT_PAIRS else True
-        if trend_ok and btc_ok:
-            log.info(f"[Signal] ✅ vwap_long {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}")
-            signals.append({
-                "direction": "long", "entry_tag": "vwap_long",
-                "price": close, "rsi": rsi,
-                "bb_pct": round((bb_lower - close) / bb_lower * 100 if bb_lower else 0, 3),
-                "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
-                "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
-                "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
-                "confirmation_softened": not raw_trend_ok and soft_confirm,
-            })
+        if not cq_long["quality_ok"]:
+            log.info(f"[Signal] ⛔ vwap_long {pair} quality filter: {cq_long['skip_reason']}")
+            db.log_signal(pair, "long", fired=False, skip_reason=cq_long["skip_reason"],
+                          price=close, rsi=rsi, btc_regime=btc_regime_label, session=session)
+        else:
+            raw_trend_ok = pair_regime_label != "bear" and pair_15m_regime_label != "bear"
+            trend_ok = raw_trend_ok or soft_confirm
+            btc_ok   = btc_regime_label != "bear" if pair in ALT_PAIRS else True
+            if trend_ok and btc_ok:
+                div_tag = " 📈divergence" if cq_long["divergence"] else ""
+                log.info(f"[Signal] ✅ vwap_long {pair} vwap_dev={vwap_dev:+.2f}% rsi={rsi:.1f}{div_tag}")
+                signals.append({
+                    "direction": "long", "entry_tag": "vwap_long",
+                    "price": close, "rsi": rsi,
+                    "bb_pct": round((bb_lower - close) / bb_lower * 100 if bb_lower else 0, 3),
+                    "ema_gap": round((ema_f - ema_s) / close * 100 if ema_f and ema_s else 0, 4),
+                    "atr_pct": round(atr_pct, 3), "vwap_dev": round(vwap_dev, 3),
+                    "vol_ratio": round(vol_ratio, 2), "session": session, "skip_reason": None,
+                    "confirmation_softened": not raw_trend_ok and soft_confirm,
+                    "divergence": cq_long["divergence"],
+                })
 
     return signals
 

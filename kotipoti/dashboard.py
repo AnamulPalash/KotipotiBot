@@ -267,7 +267,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>KotipotiBot - Codex</title>
+<title>KotipotiBot - Claude</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
@@ -476,8 +476,8 @@ function buildUI() {
   const dryRun = (s.params.leverage != null);
   wrap.appendChild(el('div',{class:'header'},
     el('div',{},
-      el('h1',{},'🤖 KotipotiBot v2'),
-      el('p',{class:'subtitle'},'Kotipoti Trading Bot - Codex - ByBit Futures - 5m')
+      el('h1',{},'🤖 KotipotiBot - Claude'),
+      el('p',{class:'subtitle'},'Kotipoti Trading Bot - Claude Edition - ByBit Futures - 5m')
     ),
     el('div',{class:'header-right'},
       el('div',{class:'badge',style:'background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);color:#10B981'},
@@ -562,7 +562,7 @@ function buildUI() {
     case 'admin':    content.appendChild(buildAdmin());    break;
   }
   wrap.appendChild(content);
-  wrap.appendChild(el('p',{class:'footer'},'KotipotiBot v2.4 · auto-refreshes every 30s · build 2026-05-25'));
+  wrap.appendChild(el('p',{class:'footer'},'KotipotiBot Claude Edition · auto-refreshes every 30s · build 2026-05-25'));
   return wrap;
 }
 
